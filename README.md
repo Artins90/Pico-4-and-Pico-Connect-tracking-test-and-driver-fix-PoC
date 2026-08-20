@@ -48,6 +48,7 @@ Results are written to logs/run_<timestamp>/:
 ## 2. How the Proxy Driver Fix Works (driver_pico.dll)
 
 The proxy driver is a drop-in wrapper placed in Pico Connect's OpenVR driver directory.
+```bash
 [ SteamVR / OpenVR ]
         │
         ▼ (Calls IVRServerDriverHost)
@@ -58,6 +59,7 @@ The proxy driver is a drop-in wrapper placed in Pico Connect's OpenVR driver dir
         │
         ▼ (Forwards original hardware communication)
 [ driver_pico_orig.dll (Official Pico Driver) ]
+```
 
 ### Operation
 1. The proxy forwards HmdDriverFactory and all initialization routines to driver_pico_orig.dll.
@@ -65,7 +67,27 @@ The proxy driver is a drop-in wrapper placed in Pico Connect's OpenVR driver dir
 3. On every unique tracking update, it computes world-space angular velocity and linear velocity using high-precision performance counters (QPC) and applies an exponential filter (alpha = 0.80).
 4. The synthesized vectors are populated into DriverPose_t.vecAngularVelocity and DriverPose_t.vecVelocity before the pose reaches SteamVR.
 
----
+
+### Driver fix Installation & Removal
+
+### Installation
+1. Close SteamVR and Pico Connect (Stop the Pico Streaming Service from the Windows services, use task manager to make sure everything VR related is closed).
+2. Navigate to Pico Connect\openvr_driver\bin\win64\ (your local Pico Connect installation path).
+3. IMPORTANT!!: Rename driver_pico.dll to driver_pico_orig.dll
+4. Copy the compiled driver_pico.dll into that folder.
+5. Start Pico Connect and SteamVR.
+
+### Verification
+1. Run Pico4VRMotionTest.exe inside VR. The audit should report:
+2. Zero-Velocity Omissions on HMD: 0
+3. FINAL VERDICT: TRACKING NORMAL (WORLD VELOCITY COMPLIANT)
+
+
+### Removal
+1. Close SteamVR and Pico Connect (Stop the Pico Streaming Service from the Windows services, use task manager to make sure everything VR related is closed).
+2. Delete driver_pico.dll.
+3. Rename driver_pico_orig.dll back to driver_pico.dll
+
 
 ## Building from Source
 
@@ -82,26 +104,5 @@ ninja -C build-win64
 Build outputs in build-win64/:
 Pico4VRMotionTest.exe
 driver_pico.dll
+```
 
-
-Driver fix Installation & Removal
-
-Installation
-Close SteamVR and Pico Connect (Stop the Pico Streaming Service from the Windows services, use task manager to make sure everything VR related is closed).
-Navigate to Pico Connect\openvr_driver\bin\win64\ (your local Pico Connect installation path).
-
-IMPORTANT!!: Rename driver_pico.dll to driver_pico_orig.dll
-
-Copy the compiled driver_pico.dll into that folder.
-Start Pico Connect and SteamVR.
-
-Verification
-Run Pico4VRMotionTest.exe inside VR. The audit should report:
-Zero-Velocity Omissions on HMD: 0
-FINAL VERDICT: TRACKING NORMAL (WORLD VELOCITY COMPLIANT)
-
-
-Removal
-Close SteamVR and Pico Connect (Stop the Pico Streaming Service from the Windows services, use task manager to make sure everything VR related is closed).
-Delete driver_pico.dll.
-Rename driver_pico_orig.dll back to driver_pico.dll
