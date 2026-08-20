@@ -1,0 +1,9 @@
+.tools/
+build/
+build-win64/
+*.dll
+*.exe
+*.lib
+*.log
+logs/
+.ninja_*

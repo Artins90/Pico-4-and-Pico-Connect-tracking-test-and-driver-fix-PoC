@@ -1,0 +1,24 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "codespaces-win64",
+      "displayName": "Codespaces -> Windows x64 (LLVM-MinGW)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-win64",
+      "toolchainFile": "${sourceDir}/cmake/llvm-mingw-x86_64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "environment": {
+        "LLVM_MINGW_ROOT": "${sourceDir}/.tools/llvm-mingw"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "codespaces-win64",
+      "configurePreset": "codespaces-win64"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "Pico 4 SteamVR Windows Cross Build",
+  "image": "mcr.microsoft.com/devcontainers/cpp:1-ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/ninja:1": {}
+  },
+  "postCreateCommand": "bash scripts/setup-codespaces.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cmake-tools",
+        "llvm-vs-code-extensions.vscode-clangd"
+      ],
+      "settings": {
+        "cmake.generator": "Ninja",
+        "cmake.configureOnOpen": true,
+        "cmake.useCMakePresets": "always"
+      }
+    }
+  }
+}

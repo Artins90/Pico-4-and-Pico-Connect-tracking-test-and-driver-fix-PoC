@@ -1,0 +1,6 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configurePreset": "codespaces-win64",
+  "cmake.buildPreset": "codespaces-win64",
+  "cmake.configureOnOpen": true
+}
