@@ -49,16 +49,16 @@ Results are written to logs/run_<timestamp>/:
 
 The proxy driver is a drop-in wrapper placed in Pico Connect's OpenVR driver directory.
 [ SteamVR / OpenVR ]
-▼ 
-(Calls IVRServerDriverHost)
+        │
+        ▼ (Calls IVRServerDriverHost)
 [ driver_pico.dll (Proxy Wrapper) ]
-──> Intercepts: TrackedDevicePoseUpdated()
-──> Computes: w_world = axis(q_t * q_{t-1}^-1) / dt
-──> Populates: DriverPose_t.vecAngularVelocity & vecVelocity
-▼ (Forwards original hardware communication)
+        │  ──> Intercepts: TrackedDevicePoseUpdated()
+        │  ──> Computes: w_world = axis(q_t * q_{t-1}^-1) / dt
+        │  ──> Populates: DriverPose_t.vecAngularVelocity & vecVelocity
+        │
+        ▼ (Forwards original hardware communication)
 [ driver_pico_orig.dll (Official Pico Driver) ]
-code
-Code
+
 ### Operation
 1. The proxy forwards HmdDriverFactory and all initialization routines to driver_pico_orig.dll.
 2. It wraps IVRServerDriverHost::TrackedDevicePoseUpdated without modifying the underlying HMD device object, preserving native DirectMode and OpenXR swapchains.
