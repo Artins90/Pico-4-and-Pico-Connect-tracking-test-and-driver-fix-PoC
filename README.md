@@ -51,16 +51,55 @@ Results are written to logs/run_<timestamp>/:
 
 The proxy driver is a drop-in wrapper placed in Pico Connect's OpenVR driver directory.
 ```bash
-[ SteamVR / OpenVR ]
+[ SteamVR / OpenVR (vrserver) ]
         │
-        ▼ (Calls IVRServerDriverHost)
+        │ calls HmdDriverFactory / IServerTrackedDeviceProvider
+        ▼
 [ driver_pico.dll (Proxy Wrapper) ]
-        │  ──> Intercepts: TrackedDevicePoseUpdated()
-        │  ──> Computes: w_world = axis(q_t * q_{t-1}^-1) / dt
-        │  ──> Populates: DriverPose_t.vecAngularVelocity & vecVelocity
         │
-        ▼ (Forwards original hardware communication)
+        │ delegates provider/driver calls
+        ▼
 [ driver_pico_orig.dll (Official Pico Driver) ]
+        │
+        │ handles real hardware
+        │ calls IVRServerDriverHost callbacks
+        ▼
+[ ProxyServerDriverHost inside driver_pico.dll ]
+        │
+        │ --- Velocity Synthesis ---
+        │
+        │  1. Store previous pose + time:
+        │        q_prev, p_prev, t_prev
+        │
+        │  2. Get current pose + time:
+        │        q_t, p_t, t
+        │
+        │  3. dt = t - t_prev
+        │
+        │  4. Compute relative rotation:
+        │        dq = normalize( q_t * q_prev^-1 )
+        │
+        │  5. Extract rotation angle:
+        │        θ = 2 * acos( clamp(dq.w, 0, 1) )
+        │
+        │  6. Extract rotation axis:
+        │        axis = (dq.x, dq.y, dq.z) / sin(θ/2)
+        │
+        │  7. Compute angular velocity:
+        │        ω_world = axis * (θ / dt)
+        │
+        │  8. Compute linear velocity:
+        │        v_world = (p_t - p_prev) / dt
+        │
+        │  9. Smoothing:
+        │        ω = α * ω_new + (1 - α) * ω_old
+        │        v = α * v_new + (1 - α) * v_old
+        │
+        │ 10. Write into DriverPose_t:
+        │        pose.vecAngularVelocity = ω
+        │        pose.vecVelocity        = v
+        ▼
+[ Real IVRServerDriverHost (SteamVR) ]
 ```
 
 ### Operation
