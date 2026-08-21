@@ -80,7 +80,7 @@ The proxy driver is a drop-in wrapper placed in Pico Connect's OpenVR driver dir
 5. Start Pico Connect and SteamVR.
 
 ### Verification
-1. Run Pico4VRMotionTest.exe inside VR. The audit should report:
+1. Run Pico4VRMotionTest.exe it should open test in SteamVr. After the test, the audit should report:
 2. Zero-Velocity Omissions on HMD: 0
 3. FINAL VERDICT: TRACKING NORMAL (WORLD VELOCITY COMPLIANT)
 
