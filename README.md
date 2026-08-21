@@ -1,3 +1,5 @@
+**DISCLAIMER:** This software is an experimental proof-of-concept provided "AS IS", without warranty of any kind, express or implied. Use at your own risk. The author assumes no responsibility or liability for any system instability, software conflicts, loss of data, or hardware issues resulting from the use of these tools or driver modifications. This project is independent and is not affiliated with, endorsed by, or associated with Pico Immersive Pte. Ltd., ByteDance, Valve Corporation, or SteamVR.
+
 # Pico 4 SteamVR Tracking Diagnostics & Velocity Fix (PoC)
 
 This repository contains two components:
@@ -74,7 +76,7 @@ The proxy driver is a drop-in wrapper placed in Pico Connect's OpenVR driver dir
 1. Close SteamVR and Pico Connect (Stop the Pico Streaming Service from the Windows services, use task manager to make sure everything VR related is closed).
 2. Navigate to Pico Connect\openvr_driver\bin\win64\ (your local Pico Connect installation path).
 3. IMPORTANT!!: Rename driver_pico.dll to driver_pico_orig.dll
-4. Copy the compiled driver_pico.dll into that folder.
+4. Copy the fixed driver_pico.dll you downloaded from this repository into that folder (Pico Connect\openvr_driver\bin\win64\).
 5. Start Pico Connect and SteamVR.
 
 ### Verification
