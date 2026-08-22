@@ -218,6 +218,15 @@ static Vec3 gControllerRightOmega{};
 static bool gControllerLeftValid = false;
 static bool gControllerRightValid = false;
 
+// Guards every direct call into IVRSystem / IVRCompositor that can be reached
+// from more than one thread (the sampler thread and the main/render thread).
+// OpenVR does not publish a general cross-thread-safety guarantee for mixing
+// IVRSystem and IVRCompositor calls, so this mutex is a client-side mitigation
+// rather than a documented contract. See the note above the sampler thread's
+// pose queries and the main loop's compositor calls for the specific tradeoff
+// this implies for compositor->WaitGetPoses().
+static std::mutex gVrApiMutex;
+
 static BOOL WINAPI CtrlHandler(DWORD type) {
     if(type==CTRL_C_EVENT || type==CTRL_CLOSE_EVENT || type==CTRL_BREAK_EVENT || type==CTRL_SHUTDOWN_EVENT) {
         gRunning.store(false);
@@ -457,6 +466,11 @@ public:
 
         const UINT vbBytes = 6 * 1024 * 1024;
         D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        // NOTE: D3D12_TEXTURE_LAYOUT_ROW_MAJOR is correct here, not a bug.
+        // Per the D3D12_RESOURCE_DESC docs, buffer resources (Dimension ==
+        // D3D12_RESOURCE_DIMENSION_BUFFER) are REQUIRED to set Layout to
+        // D3D12_TEXTURE_LAYOUT_ROW_MAJOR; D3D12_TEXTURE_LAYOUT_UNKNOWN is for
+        // textures with a driver-chosen layout and is invalid on a buffer.
         D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = vbBytes; rd.Height = 1;
         rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         rd.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -648,9 +662,16 @@ public:
         vr::D3D12TextureData_t rightData{eyeTextures_[1].Get(), queue_.Get(), 0};
         vr::Texture_t left{&leftData, vr::TextureType_DirectX12, vr::ColorSpace_Gamma};
         vr::Texture_t right{&rightData, vr::TextureType_DirectX12, vr::ColorSpace_Gamma};
-        
-        compositor_->Submit(vr::Eye_Left, &left, nullptr, vr::Submit_Default);
-        compositor_->Submit(vr::Eye_Right, &right, nullptr, vr::Submit_Default);
+
+        {
+            // compositor->Submit() touches the same IVRCompositor connection that
+            // the sampler thread's IVRSystem pose queries and the main loop's
+            // WaitGetPoses/PollNextEvent calls use. Serialize it against the
+            // sampler thread via gVrApiMutex for the same reason as those calls.
+            std::lock_guard<std::mutex> vrLock(gVrApiMutex);
+            compositor_->Submit(vr::Eye_Left, &left, nullptr, vr::Submit_Default);
+            compositor_->Submit(vr::Eye_Right, &right, nullptr, vr::Submit_Default);
+        }
 
         const uint64_t fenceVal = ++fenceValue_;
         queue_->Signal(fence_.Get(), fenceVal);
@@ -776,6 +797,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 static bool PollInputTrigger(vr::IVRSystem* vrSystem) {
     if((GetAsyncKeyState(VK_SPACE) & 0x8000) || (GetAsyncKeyState(VK_RETURN) & 0x8000)) return true;
     if(!vrSystem) return false;
+
+    // Also touches IVRSystem from the main thread; guarded for the same
+    // cross-thread reason as the other vrSystem/compositor call sites.
+    std::lock_guard<std::mutex> vrLock(gVrApiMutex);
     for(vr::TrackedDeviceIndex_t i = 1; i < vr::k_unMaxTrackedDeviceCount; ++i) {
         if(vrSystem->GetTrackedDeviceClass(i) == vr::TrackedDeviceClass_Controller) {
             vr::VRControllerState_t cs{};
@@ -881,6 +906,17 @@ int main(int, char**) {
         int zeroVelIssues = 0;
         int totalLoggedSamples = 0;
 
+        // Denominator counters, tracked separately per bug-class so the >5%
+        // failure-rate threshold below is computed against only the samples
+        // where that failure mode is actually *possible* to observe, instead
+        // of against every logged sample (which includes long stationary /
+        // low-speed stretches where e.g. a zero-velocity omission isn't
+        // meaningful/expected). See the restart block for where these are
+        // cleared alongside the other per-run counters.
+        int highSpeedSamples = 0;      // currentSpeedDegS > 15.0 (zero-vel bug denominator)
+        int tiltEligibleSamples = 0;   // tilt > 15.0 && reportedSpeedDegS >= 10.0 (local-frame bug denominator)
+        int uprightEligibleSamples = 0; // Phase1 samples with reportedSpeedDegS >= 10.0 (prediction-fault denominator)
+
         uint64_t auditInstantZeroCount = 0;
         uint64_t auditPredZeroCount = 0;
         uint64_t auditRawSpaceZeroCount = 0;
@@ -897,13 +933,35 @@ int main(int, char**) {
             const double t = std::chrono::duration<double>(tp - start).count();
 
             vr::TrackedDevicePose_t posesInstant[vr::k_unMaxTrackedDeviceCount]{};
-            vrSystem->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, posesInstant, vr::k_unMaxTrackedDeviceCount);
-
             vr::TrackedDevicePose_t posesPred[vr::k_unMaxTrackedDeviceCount]{};
-            vrSystem->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0111f, posesPred, vr::k_unMaxTrackedDeviceCount);
-
             vr::TrackedDevicePose_t posesRawSpace[vr::k_unMaxTrackedDeviceCount]{};
-            vrSystem->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseRawAndUncalibrated, 0.0f, posesRawSpace, vr::k_unMaxTrackedDeviceCount);
+            {
+                // These three calls form one logical "sample" and are also the
+                // sampler thread's only entry points into IVRSystem, which the
+                // main thread calls concurrently (PollNextEvent, WaitGetPoses,
+                // GetTrackedDeviceIndexForControllerRole, PollInputTrigger, and
+                // compositor->Submit). OpenVR does not document IVRSystem /
+                // IVRCompositor as safe to call simultaneously from multiple
+                // threads, so gVrApiMutex serializes all of these call sites
+                // as a mitigation.
+                //
+                // Deliberate exception: compositor->WaitGetPoses() on the main
+                // thread is NOT covered by this lock. It's designed to block
+                // until the compositor's "running start" signal, and holding
+                // this mutex across that wait would stall the sampler thread
+                // for up to a full frame period on every main-loop iteration,
+                // collapsing its whole reason for existing (dense, frame-rate-
+                // independent ground-truth sampling for the audit). Leaving it
+                // unlocked keeps a narrow residual race between WaitGetPoses
+                // and these calls; if that residual risk needs to be closed
+                // too, the sampler would need to stop calling IVRSystem
+                // directly and instead read poses handed off from the main
+                // thread (a larger architectural change than a mutex).
+                std::lock_guard<std::mutex> vrLock(gVrApiMutex);
+                vrSystem->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, posesInstant, vr::k_unMaxTrackedDeviceCount);
+                vrSystem->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0111f, posesPred, vr::k_unMaxTrackedDeviceCount);
+                vrSystem->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseRawAndUncalibrated, 0.0f, posesRawSpace, vr::k_unMaxTrackedDeviceCount);
+            }
 
             Vec3 renderOmega{}, gameOmega{}, ctrlLOmega{}, ctrlROmega{};
             bool ctrlLValid = false, ctrlRValid = false;
@@ -952,6 +1010,15 @@ int main(int, char**) {
                 tiltedIssues = 0;
                 zeroVelIssues = 0;
                 totalLoggedSamples = 0;
+                highSpeedSamples = 0;
+                tiltEligibleSamples = 0;
+                uprightEligibleSamples = 0;
+                auditInstantZeroCount = 0;
+                auditPredZeroCount = 0;
+                auditRawSpaceZeroCount = 0;
+                auditRenderZeroCount = 0;
+                auditGameZeroCount = 0;
+                auditControllerActiveCount = 0;
                 hud.totalIssues.store(0);
                 hud.tiltEvents.store(0);
                 hud.zeroVelEvents.store(0);
@@ -994,10 +1061,13 @@ int main(int, char**) {
                     state = TestState::Finished;
                     DriverBugType finalBug = DriverBugType::None;
 
-                    // Statistical significance check: Bug requires > 5% true failure rate
-                    const int minBugThreshold = std::max(50, static_cast<int>(totalLoggedSamples * 0.05));
-                    if(zeroVelIssues >= minBugThreshold) finalBug = DriverBugType::ZeroVelocityOmission;
-                    else if(tiltedIssues >= minBugThreshold) finalBug = DriverBugType::LocalFrameMismatch;
+                    // Statistical significance check: Bug requires > 5% true failure rate,
+                    // measured against only the samples where the failure mode could have
+                    // been observed (not every logged sample -- see counter comments above).
+                    const int minZeroVelThreshold = std::max(50, static_cast<int>(highSpeedSamples * 0.05));
+                    const int minTiltThreshold = std::max(50, static_cast<int>(tiltEligibleSamples * 0.05));
+                    if(zeroVelIssues >= minZeroVelThreshold) finalBug = DriverBugType::ZeroVelocityOmission;
+                    else if(tiltedIssues >= minTiltThreshold) finalBug = DriverBugType::LocalFrameMismatch;
                     hud.bugType.store(finalBug);
 
                     if(csv) csv->close();
@@ -1013,20 +1083,20 @@ int main(int, char**) {
                                  << "Display Frequency:        " << displayFreq << " Hz\n\n"
                                  << "FINAL VERDICT:            " << (finalBug == DriverBugType::ZeroVelocityOmission ? "ZERO-VELOCITY BUG CONFIRMED (Driver omits angular velocity)" :
                                                                   (finalBug == DriverBugType::LocalFrameMismatch ? "LOCAL-UP FRAME BUG CONFIRMED (Velocity in wrong coordinate frame)" : "TRACKING NORMAL (WORLD VELOCITY COMPLIANT)")) << "\n\n"
-                                 << "API PATHWAY VELOCITY AUDIT:\n"
-                                 << "1. IVRSystem (Instantaneous 0.0s):        " << auditInstantZeroCount << " / " << totalLoggedSamples << " samples zeroed\n"
-                                 << "2. IVRSystem (Forward Predicted +11.1ms): " << auditPredZeroCount << " / " << totalLoggedSamples << " samples zeroed\n"
-                                 << "3. IVRSystem (RawUncalibrated Space):     " << auditRawSpaceZeroCount << " / " << totalLoggedSamples << " samples zeroed\n"
-                                 << "4. IVRCompositor (WaitGetPoses Render):   " << auditRenderZeroCount << " / " << totalLoggedSamples << " samples zeroed\n"
-                                 << "5. IVRCompositor (GetLastPoses Game):     " << auditGameZeroCount << " / " << totalLoggedSamples << " samples zeroed\n\n"
+                                 << "API PATHWAY VELOCITY AUDIT (of " << highSpeedSamples << " high-speed samples):\n"
+                                 << "1. IVRSystem (Instantaneous 0.0s):        " << auditInstantZeroCount << " / " << highSpeedSamples << " samples zeroed\n"
+                                 << "2. IVRSystem (Forward Predicted +11.1ms): " << auditPredZeroCount << " / " << highSpeedSamples << " samples zeroed\n"
+                                 << "3. IVRSystem (RawUncalibrated Space):     " << auditRawSpaceZeroCount << " / " << highSpeedSamples << " samples zeroed\n"
+                                 << "4. IVRCompositor (WaitGetPoses Render):   " << auditRenderZeroCount << " / " << highSpeedSamples << " samples zeroed\n"
+                                 << "5. IVRCompositor (GetLastPoses Game):     " << auditGameZeroCount << " / " << highSpeedSamples << " samples zeroed\n\n"
                                  << "HARDWARE CONTROL TEST (CONTROLLER VS HMD):\n"
                                  << "- Controller Velocity Events Recorded:   " << auditControllerActiveCount << " samples\n"
                                  << "- Result: Both HMD and Controllers report active velocity vectors in World tracking space.\n\n"
                                  << "METRIC TOTALS:\n"
                                  << "- Total Samples Logged:                   " << totalLoggedSamples << "\n"
-                                 << "- Upright Prediction Faults:              " << uprightIssues << "\n"
-                                 << "- Zero-Velocity Omissions on HMD:         " << zeroVelIssues << "\n"
-                                 << "- Tilted Local-Frame Faults:              " << tiltedIssues << " (" << (totalLoggedSamples > 0 ? (tiltedIssues * 100 / totalLoggedSamples) : 0) << "%)\n"
+                                 << "- Upright Prediction Faults:              " << uprightIssues << " / " << uprightEligibleSamples << " (" << (uprightEligibleSamples > 0 ? (uprightIssues * 100 / uprightEligibleSamples) : 0) << "%)\n"
+                                 << "- Zero-Velocity Omissions on HMD:         " << zeroVelIssues << " / " << highSpeedSamples << " (" << (highSpeedSamples > 0 ? (zeroVelIssues * 100 / highSpeedSamples) : 0) << "%)\n"
+                                 << "- Tilted Local-Frame Faults:              " << tiltedIssues << " / " << tiltEligibleSamples << " (" << (tiltEligibleSamples > 0 ? (tiltedIssues * 100 / tiltEligibleSamples) : 0) << "%)\n"
                                  << "======================================================================\n";
                         summary->close();
                     }
@@ -1113,6 +1183,7 @@ int main(int, char**) {
                 hud.frameModel.store(modelMatch);
 
                 if(currentSpeedDegS > 15.0) {
+                    highSpeedSamples++;
                     if(Length(s.audit.sysInstantOmega) < 1e-4) auditInstantZeroCount++;
                     if(Length(s.audit.sysPredOmega) < 1e-4) auditPredZeroCount++;
                     if(Length(s.audit.sysRawSpaceOmega) < 1e-4) auditRawSpaceZeroCount++;
@@ -1120,15 +1191,39 @@ int main(int, char**) {
                     if(Length(s.audit.waitGetGameOmega) < 1e-4) auditGameZeroCount++;
                     if(ctrlMaxSpeed > 5.0) auditControllerActiveCount++;
                 }
+                if(tilt > 15.0 && reportedSpeedDegS >= 10.0) {
+                    tiltEligibleSamples++;
+                }
+                if(state == TestState::Phase1_Upright && reportedSpeedDegS >= 10.0) {
+                    uprightEligibleSamples++;
+                }
+
+                // Threshold for treating the reported-velocity vs. re-integrated-pose
+                // mismatch as a genuine prediction fault rather than ordinary numerical
+                // noise. 5 degrees of rotation error over the ~11ms prediction window
+                // used elsewhere in this file is well above what quantization/estimation
+                // noise alone would produce at these sample rates.
+                constexpr double kPredictionErrorThresholdDeg = 5.0;
 
                 std::string flags;
                 if(currentSpeedDegS > 15.0 && reportedSpeedDegS < 1.0) {
                     if(!flags.empty()) flags += '|'; flags += "ZERO_VEL_BUG";
                 }
-                
+
                 // AV_FRAME_BUG fires ONLY if modelMatch == -1 (Local Frame is strictly better fit)
                 if(modelMatch == -1 && tilt > 15.0 && reportedSpeedDegS >= 10.0) {
                     if(!flags.empty()) flags += '|'; flags += "AV_FRAME_BUG";
+                }
+
+                // PRED_ROT_BUG: the reported angular velocity, integrated forward over
+                // the real elapsed dt, fails to predict the actual measured orientation
+                // to within kPredictionErrorThresholdDeg. This is what the "Upright
+                // Prediction Faults" metric is meant to measure -- previously flags never
+                // contained the substring the Phase1 counter looked for ("PRED_ROT"), so
+                // uprightIssues was permanently 0. Gated on reportedSpeedDegS so it only
+                // fires when there's enough motion for the prediction to be meaningful.
+                if(predErr > kPredictionErrorThresholdDeg && reportedSpeedDegS >= 10.0) {
+                    if(!flags.empty()) flags += '|'; flags += "PRED_ROT_BUG";
                 }
 
                 if(state == TestState::Phase1_Upright || state == TestState::Phase2_Tilted) {
@@ -1170,24 +1265,35 @@ int main(int, char**) {
         }
 
         vr::VREvent_t vrEvent{};
-        while(vrSystem->PollNextEvent(&vrEvent, sizeof(vrEvent))) {
-            if(vrEvent.eventType == vr::VREvent_Quit) {
-                gRunning.store(false);
-                break;
+        {
+            std::lock_guard<std::mutex> vrLock(gVrApiMutex);
+            while(vrSystem->PollNextEvent(&vrEvent, sizeof(vrEvent))) {
+                if(vrEvent.eventType == vr::VREvent_Quit) {
+                    gRunning.store(false);
+                    break;
+                }
             }
         }
 
         vr::TrackedDevicePose_t renderPoses[vr::k_unMaxTrackedDeviceCount]{};
         vr::TrackedDevicePose_t gamePoses[vr::k_unMaxTrackedDeviceCount]{};
-        compositor->WaitGetPoses(renderPoses, vr::k_unMaxTrackedDeviceCount, gamePoses, vr::k_unMaxTrackedDeviceCount);
+        vr::TrackedDeviceIndex_t leftIdx, rightIdx;
+        {
+            // WaitGetPoses is deliberately NOT covered by gVrApiMutex -- see the
+            // long comment above the sampler thread's pose queries for why.
+            compositor->WaitGetPoses(renderPoses, vr::k_unMaxTrackedDeviceCount, gamePoses, vr::k_unMaxTrackedDeviceCount);
 
-        vr::TrackedDeviceIndex_t leftIdx = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
-        vr::TrackedDeviceIndex_t rightIdx = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+            std::lock_guard<std::mutex> vrLock(gVrApiMutex);
+            leftIdx = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
+            rightIdx = vrSystem->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+        }
 
         {
             std::lock_guard<std::mutex> lk(gRenderPosesMutex);
             if(renderPoses[0].bPoseIsValid) {
                 gCompositorRenderOmega = ReportedAngular(renderPoses[0]);
+            }
+            if(gamePoses[0].bPoseIsValid) {
                 gCompositorGameOmega = ReportedAngular(gamePoses[0]);
             }
             if(leftIdx < vr::k_unMaxTrackedDeviceCount && renderPoses[leftIdx].bPoseIsValid) {
