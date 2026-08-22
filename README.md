@@ -66,15 +66,28 @@ The proxy driver is a drop-in wrapper placed in Pico Connect's OpenVR driver dir
         ▼
 [ ProxyServerDriverHost inside driver_pico.dll ]
         │
-        │ --- Velocity Synthesis ---
+        │ TrackedDevicePoseUpdated(unWhichDevice, newPose)
+        │   if unWhichDevice == k_unTrackedDeviceIndex_Hmd:
+        │       fixedPose = ProcessPose(newPose)
+        │
+        │ --- Velocity Synthesis (ProcessPose) ---
+        │
+        │  0. pose.poseIsValid?
+        │        ├─ NO  → ω = v = 0
+        │        │        hasPrev_ = false
+        │        │        return (unchanged pose, no write)
+        │        └─ YES → continue
         │
         │  1. Store previous pose + time:
         │        q_prev, p_prev, t_prev
         │
-        │  2. Get current pose + time:
+        │  2. Get current pose + time (QPC):
         │        q_t, p_t, t
         │
         │  3. dt = t - t_prev
+        │        ├─ dt > 50ms   → ω = v = 0  (stale-gap reset)
+        │        ├─ dt < 3ms    → keep previous ω, v  (skip sample)
+        │        └─ 3ms..50ms   → continue to step 4
         │
         │  4. Compute relative rotation:
         │        dq = normalize( q_t * q_prev^-1 )
@@ -91,22 +104,25 @@ The proxy driver is a drop-in wrapper placed in Pico Connect's OpenVR driver dir
         │  8. Compute linear velocity:
         │        v_world = (p_t - p_prev) / dt
         │
-        │  9. Smoothing:
+        │  9. Smoothing (dt-normalized):
+        │        α = 1 - exp(-dt / τ)          [τ ≈ 6.9ms]
         │        ω = α * ω_new + (1 - α) * ω_old
         │        v = α * v_new + (1 - α) * v_old
         │
-        │ 10. Write into DriverPose_t:
+        │ 10. Write into DriverPose_t (only if finite):
         │        pose.vecAngularVelocity = ω
         │        pose.vecVelocity        = v
+        │      else: leave pose's original values untouched
         ▼
 [ Real IVRServerDriverHost (SteamVR) ]
 ```
 
 ### Operation
 1. The proxy forwards HmdDriverFactory and all initialization routines to driver_pico_orig.dll.
-2. It wraps IVRServerDriverHost::TrackedDevicePoseUpdated without modifying the underlying HMD device object, preserving native DirectMode and OpenXR swapchains.
-3. On every unique tracking update, it computes world-space angular velocity and linear velocity using high-precision performance counters (QPC) and applies an exponential filter (alpha = 0.80).
-4. The synthesized vectors are populated into DriverPose_t.vecAngularVelocity and DriverPose_t.vecVelocity before the pose reaches SteamVR.
+2. It wraps IVRServerDriverHost::TrackedDevicePoseUpdated without modifying the underlying HMD device object, preserving native DirectMode and OpenXR swapchains. Velocity synthesis only runs for k_unTrackedDeviceIndex_Hmd; all other devices pass through untouched.
+3. On every tracking update, it first checks poseIsValid — an invalid pose immediately zeroes the synthesized velocity and returns without writing anything, so a lost-and-recovered HMD never reports stale pre-loss velocity. For valid poses, it gates on elapsed time (dt) since the last sample: too short (<3ms) skips the sample and keeps the last value; too long (>50ms) resets to zero rather than carrying a stale value across the gap; only the 3–50ms range computes a new world-space angular/linear velocity via QPC timestamps.
+4. Smoothing uses an exponential filter with a dt-normalized coefficient (α = 1 − e^(−dt/τ), τ ≈ 6.9ms) instead of a fixed α = 0.80, so the filter's effective cutoff no longer drifts when the frame interval varies.
+5. The synthesized vectors are populated into DriverPose_t.vecAngularVelocity and DriverPose_t.vecVelocity before the pose reaches SteamVR — but only when both are finite; otherwise the original driver's values are left in place.
 
 
 ### Driver fix Installation & Removal
