@@ -160,8 +160,17 @@ struct MultiPathSnapshot {
     Vec3 sysRawSpaceOmega{};
     Vec3 waitGetRenderOmega{};
     Vec3 waitGetGameOmega{};
+
+    Vec3 sysInstantVel{};
+    Vec3 sysPredVel{};
+    Vec3 sysRawSpaceVel{};
+    Vec3 waitGetRenderVel{};
+    Vec3 waitGetGameVel{};
+
     Vec3 ctrlLeftOmega{};
     Vec3 ctrlRightOmega{};
+    Vec3 ctrlLeftVel{};
+    Vec3 ctrlRightVel{};
     bool ctrlLeftValid = false;
     bool ctrlRightValid = false;
 };
@@ -175,19 +184,50 @@ struct Sample {
     MultiPathSnapshot audit{};
     vr::ETrackingResult result = vr::TrackingResult_Uninitialized;
     bool poseValid = false;
+
+    double sampleDt = 0;
+    Vec3 stepDelta{};
+    double stepDistMm = 0;
+    double stepSpeedMs = 0;
+    bool isSnapback = false;
+    double snapbackMagMm = 0;
+    bool isDuplicateCall = false;
+};
+
+struct LogEntry {
+    Sample base;
+    std::string phaseName;
+    double tilt = 0;
+    Vec3 derivedWorldOmega{};
+    Vec3 derivedWorldVel{};
+    Vec3 derivedLocalVel{};
+    double rotPredErr = 0;
+    double linPredErrWithVel = 0;
+    double linErrWithZero = 0;
+    int angModel = 0;
+    int linModel = 0;
+    double linAccelJump = 0;
+    std::string issues;
+
+    double sampleDtMs = 0;
+    double baseDtMs = 0;
+    Vec3 stepDeltaMm{};
+    double stepDistMm = 0;
+    double stepSpeedMs = 0;
+    bool isSnapback = false;
+    double snapbackMagMm = 0;
+    bool isDuplicateCall = false;
+    double angWorldErrDegS = 0;
+    double angLocalErrDegS = 0;
+    double angErrMarginDegS = 0;
 };
 
 enum class TestState {
     Countdown = 0,
     Phase1_Upright,
     Phase2_Tilted,
+    Phase3_Leaning,
     Finished
-};
-
-enum class DriverBugType {
-    None = 0,
-    ZeroVelocityOmission,
-    LocalFrameMismatch
 };
 
 struct AtomicHud {
@@ -195,36 +235,44 @@ struct AtomicHud {
     std::atomic<float> stateTimer{5.0f};
     std::atomic<float> tiltDeg{0.0f};
     std::atomic<float> speedDegS{0.0f};
-    std::atomic<float> ctrlSpeedDegS{0.0f};
+    std::atomic<float> linSpeedMs{0.0f};
+    std::atomic<float> linPredErrMm{0.0f};
+    std::atomic<float> linZeroErrMm{0.0f};
     std::atomic<int> frameModel{0};
-    std::atomic<DriverBugType> bugType{DriverBugType::None};
+    std::atomic<int> linFrameModel{0};
     std::atomic<int> totalIssues{0};
-    std::atomic<int> tiltEvents{0};
     std::atomic<int> zeroVelEvents{0};
+    std::atomic<int> avFrameEvents{0};
+    std::atomic<int> zeroLinVelEvents{0};
+    std::atomic<int> linOvershootEvents{0};
     std::atomic<bool> trackingOk{false};
-    std::atomic<bool> ctrlActive{false};
+
+    std::atomic<float> appFps{90.0f};
+    std::atomic<float> warpAngleDeg{0.0f};
+    std::atomic<float> reprojectRatio{0.0f};
+    std::atomic<bool> blackEdgeRisk{false};
+
     char lastRunDir[256] = {};
     std::mutex dirMtx;
 };
 
 static std::atomic<bool> gRunning{true};
 static std::atomic<bool> gRestartBenchmark{false};
+static std::atomic<float> gTargetSimFps{90.0f};
+static std::atomic<bool> gDynamicSweepActive{false};
 
 static std::mutex gRenderPosesMutex;
 static Vec3 gCompositorRenderOmega{};
 static Vec3 gCompositorGameOmega{};
+static Vec3 gCompositorRenderVel{};
+static Vec3 gCompositorGameVel{};
 static Vec3 gControllerLeftOmega{};
 static Vec3 gControllerRightOmega{};
+static Vec3 gControllerLeftVel{};
+static Vec3 gControllerRightVel{};
 static bool gControllerLeftValid = false;
 static bool gControllerRightValid = false;
 
-// Guards every direct call into IVRSystem / IVRCompositor that can be reached
-// from more than one thread (the sampler thread and the main/render thread).
-// OpenVR does not publish a general cross-thread-safety guarantee for mixing
-// IVRSystem and IVRCompositor calls, so this mutex is a client-side mitigation
-// rather than a documented contract. See the note above the sampler thread's
-// pose queries and the main loop's compositor calls for the specific tradeoff
-// this implies for compositor->WaitGetPoses().
 static std::mutex gVrApiMutex;
 
 static BOOL WINAPI CtrlHandler(DWORD type) {
@@ -267,46 +315,49 @@ struct ScopedTimerResolution {
     }
 };
 
-static void WriteCsvHeader(std::ofstream& f) {
+static void WriteCsvHeader(std::ofstream& f, bool isIncidentLog = false) {
+    if (isIncidentLog) {
+        f << "incident_id,context_tag,";
+    }
     f << "time_s,phase,head_tilt_deg,"
       << "pos_x_m,pos_y_m,pos_z_m,"
       << "quat_w,quat_x,quat_y,quat_z,"
-      << "sys_instant_omega_x_rad_s,sys_instant_omega_y_rad_s,sys_instant_omega_z_rad_s,"
-      << "sys_pred_omega_x_rad_s,sys_pred_omega_y_rad_s,sys_pred_omega_z_rad_s,"
-      << "sys_raw_omega_x_rad_s,sys_raw_omega_y_rad_s,sys_raw_omega_z_rad_s,"
-      << "compositor_render_omega_x_rad_s,compositor_render_omega_y_rad_s,compositor_render_omega_z_rad_s,"
-      << "compositor_game_omega_x_rad_s,compositor_game_omega_y_rad_s,compositor_game_omega_z_rad_s,"
-      << "ctrl_left_omega_x_rad_s,ctrl_left_omega_y_rad_s,ctrl_left_omega_z_rad_s,"
-      << "ctrl_right_omega_x_rad_s,ctrl_right_omega_y_rad_s,ctrl_right_omega_z_rad_s,"
-      << "measured_world_omega_x_rad_s,measured_world_omega_y_rad_s,measured_world_omega_z_rad_s,"
-      << "measured_local_omega_x_rad_s,measured_local_omega_y_rad_s,measured_local_omega_z_rad_s,"
+      << "reported_omega_x_rad_s,reported_omega_y_rad_s,reported_omega_z_rad_s,"
       << "reported_vel_x_m_s,reported_vel_y_m_s,reported_vel_z_m_s,"
+      << "derived_world_omega_x_rad_s,derived_world_omega_y_rad_s,derived_world_omega_z_rad_s,"
+      << "derived_world_vel_x_m_s,derived_world_vel_y_m_s,derived_world_vel_z_m_s,"
+      << "derived_local_vel_x_m_s,derived_local_vel_y_m_s,derived_local_vel_z_m_s,"
       << "angular_prediction_error_deg,"
-      << "angular_velocity_error_world_deg_s,angular_velocity_error_local_deg_s,"
-      << "preferred_velocity_frame,linear_prediction_error_mm,"
-      << "derived_angular_accel_jump_deg_s2,issues\n";
+      << "linear_prediction_error_with_vel_mm,linear_error_with_zero_vel_mm,"
+      << "preferred_angular_frame,preferred_linear_frame,"
+      << "derived_linear_accel_jump_m_s2,issues,"
+      << "sample_dt_ms,base_dt_ms,"
+      << "step_dx_mm,step_dy_mm,step_dz_mm,step_dist_mm,step_speed_m_s,"
+      << "is_snapback,snapback_mag_mm,is_duplicate_call,"
+      << "ang_world_err_deg_s,ang_local_err_deg_s,ang_err_margin_deg_s\n";
 }
 
-static void LogEvent(std::ofstream& f, const Sample& base, const std::string& phaseName, double tilt,
-                     Vec3 measuredWorldOmega, Vec3 measuredLocalOmega,
-                     double predErr, double worldErr, double localErr, int model,
-                     double posErrMm, double accelJump, const std::string& issues) {
+static void LogEvent(std::ofstream& f, const LogEntry& e, int incidentId = -1, const std::string& contextTag = "") {
+    if (incidentId >= 0) {
+        f << incidentId << ',' << contextTag << ',';
+    }
     f << std::fixed << std::setprecision(6)
-      << base.t << ',' << phaseName << ',' << tilt << ','
-      << base.p.x << ',' << base.p.y << ',' << base.p.z << ','
-      << base.q.w << ',' << base.q.x << ',' << base.q.y << ',' << base.q.z << ','
-      << base.audit.sysInstantOmega.x << ',' << base.audit.sysInstantOmega.y << ',' << base.audit.sysInstantOmega.z << ','
-      << base.audit.sysPredOmega.x << ',' << base.audit.sysPredOmega.y << ',' << base.audit.sysPredOmega.z << ','
-      << base.audit.sysRawSpaceOmega.x << ',' << base.audit.sysRawSpaceOmega.y << ',' << base.audit.sysRawSpaceOmega.z << ','
-      << base.audit.waitGetRenderOmega.x << ',' << base.audit.waitGetRenderOmega.y << ',' << base.audit.waitGetRenderOmega.z << ','
-      << base.audit.waitGetGameOmega.x << ',' << base.audit.waitGetGameOmega.y << ',' << base.audit.waitGetGameOmega.z << ','
-      << base.audit.ctrlLeftOmega.x << ',' << base.audit.ctrlLeftOmega.y << ',' << base.audit.ctrlLeftOmega.z << ','
-      << base.audit.ctrlRightOmega.x << ',' << base.audit.ctrlRightOmega.y << ',' << base.audit.ctrlRightOmega.z << ','
-      << measuredWorldOmega.x << ',' << measuredWorldOmega.y << ',' << measuredWorldOmega.z << ','
-      << measuredLocalOmega.x << ',' << measuredLocalOmega.y << ',' << measuredLocalOmega.z << ','
-      << base.velocity.x << ',' << base.velocity.y << ',' << base.velocity.z << ','
-      << predErr << ',' << worldErr << ',' << localErr << ',' << ModelFrameName(model) << ','
-      << posErrMm << ',' << accelJump << ',' << (issues.empty() ? "NONE" : issues) << '\n';
+      << e.base.t << ',' << e.phaseName << ',' << e.tilt << ','
+      << e.base.p.x << ',' << e.base.p.y << ',' << e.base.p.z << ','
+      << e.base.q.w << ',' << e.base.q.x << ',' << e.base.q.y << ',' << e.base.q.z << ','
+      << e.base.omega.x << ',' << e.base.omega.y << ',' << e.base.omega.z << ','
+      << e.base.velocity.x << ',' << e.base.velocity.y << ',' << e.base.velocity.z << ','
+      << e.derivedWorldOmega.x << ',' << e.derivedWorldOmega.y << ',' << e.derivedWorldOmega.z << ','
+      << e.derivedWorldVel.x << ',' << e.derivedWorldVel.y << ',' << e.derivedWorldVel.z << ','
+      << e.derivedLocalVel.x << ',' << e.derivedLocalVel.y << ',' << e.derivedLocalVel.z << ','
+      << e.rotPredErr << ',' << e.linPredErrWithVel << ',' << e.linErrWithZero << ','
+      << ModelFrameName(e.angModel) << ',' << ModelFrameName(e.linModel) << ','
+      << e.linAccelJump << ',' << (e.issues.empty() ? "NONE" : e.issues) << ','
+      << e.sampleDtMs << ',' << e.baseDtMs << ','
+      << e.stepDeltaMm.x << ',' << e.stepDeltaMm.y << ',' << e.stepDeltaMm.z << ','
+      << e.stepDistMm << ',' << e.stepSpeedMs << ','
+      << (e.isSnapback ? 1 : 0) << ',' << e.snapbackMagMm << ',' << (e.isDuplicateCall ? 1 : 0) << ','
+      << e.angWorldErrDegS << ',' << e.angLocalErrDegS << ',' << e.angErrMarginDegS << '\n';
 }
 
 struct Vertex {
@@ -422,8 +473,7 @@ public:
         vrSystem_->GetOutputDevice(&vrAdapterLuid, vr::TextureType_DirectX12, nullptr);
 
         ComPtr<IDXGIFactory4> factory;
-        HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
-        if(FAILED(hr)) return false;
+        if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
 
         ComPtr<IDXGIAdapter1> chosenAdapter;
         ComPtr<IDXGIAdapter1> adapter;
@@ -466,11 +516,6 @@ public:
 
         const UINT vbBytes = 6 * 1024 * 1024;
         D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-        // NOTE: D3D12_TEXTURE_LAYOUT_ROW_MAJOR is correct here, not a bug.
-        // Per the D3D12_RESOURCE_DESC docs, buffer resources (Dimension ==
-        // D3D12_RESOURCE_DIMENSION_BUFFER) are REQUIRED to set Layout to
-        // D3D12_TEXTURE_LAYOUT_ROW_MAJOR; D3D12_TEXTURE_LAYOUT_UNKNOWN is for
-        // textures with a driver-chosen layout and is invalid on a buffer.
         D3D12_RESOURCE_DESC rd{}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = vbBytes; rd.Height = 1;
         rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         rd.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -490,117 +535,118 @@ public:
         const TestState state = hud.state.load();
         const float timer = hud.stateTimer.load();
         const float tilt = hud.tiltDeg.load();
-        const float speed = hud.speedDegS.load();
-        const float ctrlSpeed = hud.ctrlSpeedDegS.load();
-        const bool ctrlActive = hud.ctrlActive.load();
-        const int model = hud.frameModel.load();
-        const DriverBugType bugType = hud.bugType.load();
-        const int totalIssues = hud.totalIssues.load();
-        const int tiltEvents = hud.tiltEvents.load();
+        const float rotSpeed = hud.speedDegS.load();
+        const float linSpeed = hud.linSpeedMs.load();
+        const float linPredErr = hud.linPredErrMm.load();
+        const float linZeroErr = hud.linZeroErrMm.load();
+        const int angModel = hud.frameModel.load();
+        const int linModel = hud.linFrameModel.load();
         const int zeroVelEvents = hud.zeroVelEvents.load();
+        const int avFrameEvents = hud.avFrameEvents.load();
+        const int zeroLinVelEvents = hud.zeroLinVelEvents.load();
+        const int linOvershootEvents = hud.linOvershootEvents.load();
+
+        const float fps = hud.appFps.load();
+        const float warpDeg = hud.warpAngleDeg.load();
+        const float reprojectRatio = hud.reprojectRatio.load();
+        const bool blackEdge = hud.blackEdgeRisk.load();
 
         const float cW = 1920.0f;
         const float cH = 1080.0f;
 
-        AddCanvasRect(rawVerts, 80, 60, cW - 80, cH - 60, 0.12f, 0.20f, 0.35f, 0.95f);
-        AddCanvasRect(rawVerts, 86, 66, cW - 86, cH - 66, 0.02f, 0.03f, 0.05f, 0.95f);
+        AddCanvasRect(rawVerts, 80, 50, cW - 80, cH - 50, 0.10f, 0.15f, 0.25f, 0.95f);
+        AddCanvasRect(rawVerts, 86, 56, cW - 86, cH - 56, 0.02f, 0.03f, 0.05f, 0.95f);
 
-        AddCanvasRect(rawVerts, 86, 66, cW - 86, 170, 0.08f, 0.14f, 0.24f, 1.0f);
-        AddCanvasText(rawVerts, "PICO 4 OPENVR VELOCITY AUDIT & BENCHMARK", 110, 95, 6.0f, 0.40f, 0.85f, 1.0f);
+        AddCanvasRect(rawVerts, 86, 56, cW - 86, 150, 0.06f, 0.12f, 0.20f, 1.0f);
+        AddCanvasText(rawVerts, "PICO 4 OPENVR TIMEWARP & PREDICTION BENCHMARK", 110, 80, 5.2f, 0.40f, 0.85f, 1.0f);
+
+        std::ostringstream wstr;
+        wstr << (gDynamicSweepActive.load() ? "SWEEP FPS: " : "SIMULATED FPS: ")
+             << std::fixed << std::setprecision(0) << fps
+             << " | REPROJECTED: " << std::setprecision(0) << (reprojectRatio * 100.0f) << "%"
+             << " | WARP ANGLE: " << std::setprecision(2) << warpDeg << " DEG";
+        AddCanvasText(rawVerts, wstr.str(), 110, 115, 3.8f, (fps < 85.0f) ? 1.0f : 0.4f, (fps < 85.0f) ? 0.6f : 1.0f, 0.4f);
+
+        if(blackEdge) {
+            AddCanvasRect(rawVerts, cW - 480, 75, cW - 110, 135, 0.80f, 0.15f, 0.15f, 0.95f);
+            AddCanvasText(rawVerts, "BLACK EDGE OVERFLOW!", cW - 460, 95, 4.0f, 1.0f, 1.0f, 1.0f);
+        }
 
         if(state == TestState::Countdown) {
-            AddCanvasRect(rawVerts, 130, 200, cW - 130, 320, 0.35f, 0.30f, 0.05f, 0.85f);
+            AddCanvasRect(rawVerts, 130, 180, cW - 130, 300, 0.35f, 0.30f, 0.05f, 0.85f);
             std::ostringstream cd; cd << "STARTING IN " << std::fixed << std::setprecision(1) << timer << "S...";
-            AddCanvasText(rawVerts, cd.str(), 160, 235, 7.0f, 1.0f, 0.85f, 0.20f);
-            AddCanvasText(rawVerts, "PREPARE TO SHAKE HEAD UPRIGHT (PHASE 1)", 160, 380, 5.0f, 0.85f, 0.90f, 0.95f);
-            AddCanvasText(rawVerts, "TIP: SHAKE A CONTROLLER TO VERIFY CONTROLLER VELOCITY", 160, 440, 4.5f, 0.40f, 0.90f, 0.50f);
+            AddCanvasText(rawVerts, cd.str(), 160, 215, 7.0f, 1.0f, 0.85f, 0.20f);
+            AddCanvasText(rawVerts, "PREPARE FOR BENCHMARK [KEYS 1-5 IN CONSOLE TO TEST FRAMERATES]", 160, 360, 4.2f, 0.85f, 0.90f, 0.95f);
         }
-        else if(state == TestState::Phase1_Upright || state == TestState::Phase2_Tilted) {
-            const bool isPhase1 = (state == TestState::Phase1_Upright);
-
-            AddCanvasRect(rawVerts, 130, 190, cW - 130, 290, isPhase1 ? 0.10f : 0.40f, 0.20f, isPhase1 ? 0.45f : 0.10f, 0.9f);
+        else if(state == TestState::Phase1_Upright || state == TestState::Phase2_Tilted || state == TestState::Phase3_Leaning) {
             std::ostringstream phHdr;
-            phHdr << (isPhase1 ? "PHASE 1/2: UPRIGHT BASELINE [" : "PHASE 2/2: TILTED TRIGGER [")
-                  << std::fixed << std::setprecision(1) << timer << "S LEFT]";
-            AddCanvasText(rawVerts, phHdr.str(), 160, 220, 6.0f, 1.0f, 1.0f, 1.0f);
-
-            if(isPhase1) {
-                AddCanvasText(rawVerts, "ACTION: KEEP HEAD LEVEL AND SHAKE LEFT/RIGHT (YAW)", 160, 330, 4.8f, 0.5f, 1.0f, 0.8f);
-                if(tilt > 15.0f) AddCanvasText(rawVerts, "WARNING: KEEP HEAD UPRIGHT (<15 DEG)!", 160, 390, 5.0f, 1.0f, 0.3f, 0.2f);
-                else AddCanvasText(rawVerts, "STATUS: HEAD UPRIGHT AND ALIGNED", 160, 390, 4.5f, 0.6f, 0.9f, 0.6f);
+            if(state == TestState::Phase1_Upright) {
+                AddCanvasRect(rawVerts, 130, 170, cW - 130, 260, 0.10f, 0.20f, 0.45f, 0.9f);
+                phHdr << "PHASE 1/3: UPRIGHT ROTATION [" << std::fixed << std::setprecision(1) << timer << "S LEFT]";
+                AddCanvasText(rawVerts, phHdr.str(), 160, 195, 5.5f, 1.0f, 1.0f, 1.0f);
+                AddCanvasText(rawVerts, "ACTION: KEEP HEAD LEVEL AND SHAKE LEFT/RIGHT (YAW)", 160, 290, 4.5f, 0.5f, 1.0f, 0.8f);
+                if(tilt > 15.0f) AddCanvasText(rawVerts, "WARNING: KEEP HEAD UPRIGHT (<15 DEG)!", 160, 330, 4.2f, 1.0f, 0.3f, 0.2f);
+            } else if(state == TestState::Phase2_Tilted) {
+                AddCanvasRect(rawVerts, 130, 170, cW - 130, 260, 0.40f, 0.20f, 0.10f, 0.9f);
+                phHdr << "PHASE 2/3: TILTED ROTATION [" << std::fixed << std::setprecision(1) << timer << "S LEFT]";
+                AddCanvasText(rawVerts, phHdr.str(), 160, 195, 5.5f, 1.0f, 1.0f, 1.0f);
+                AddCanvasText(rawVerts, "ACTION: TILT EAR TO SHOULDER (35-45 DEG) AND SHAKE HEAD", 160, 290, 4.5f, 1.0f, 0.8f, 0.2f);
+                if(tilt < 25.0f) AddCanvasText(rawVerts, ">> TILT MORE (>25 DEG) TO TEST ROTATION FRAME <<", 160, 330, 4.2f, 1.0f, 0.3f, 0.2f);
+                else AddCanvasText(rawVerts, "STATUS: TARGET TILT REACHED! KEEP SHAKING!", 160, 330, 4.2f, 0.3f, 1.0f, 0.4f);
             } else {
-                AddCanvasText(rawVerts, "ACTION: TILT EAR TO SHOULDER (35-45 DEG) AND SHAKE HEAD!", 160, 330, 4.8f, 1.0f, 0.8f, 0.2f);
-                if(tilt < 25.0f) AddCanvasText(rawVerts, ">> TILT MORE (>25 DEG) TO TEST ROTATION FRAME <<", 160, 390, 5.2f, 1.0f, 0.3f, 0.2f);
-                else AddCanvasText(rawVerts, "STATUS: TARGET TILT REACHED! KEEP SHAKING!", 160, 390, 5.0f, 0.3f, 1.0f, 0.4f);
+                AddCanvasRect(rawVerts, 130, 170, cW - 130, 260, 0.15f, 0.40f, 0.20f, 0.9f);
+                phHdr << "PHASE 3/3: TRANSLATIONAL LEAN & SURGE [" << std::fixed << std::setprecision(1) << timer << "S LEFT]";
+                AddCanvasText(rawVerts, phHdr.str(), 160, 195, 5.5f, 1.0f, 1.0f, 1.0f);
+                AddCanvasText(rawVerts, "ACTION: KEEP HEAD POINTING FORWARD, LEAN FORWARD/BACK (Z-AXIS)!", 160, 290, 4.2f, 0.3f, 1.0f, 0.4f);
             }
 
-            AddCanvasRect(rawVerts, 140, 460, cW - 140, cH - 100, 0.05f, 0.08f, 0.12f, 0.95f);
+            AddCanvasRect(rawVerts, 140, 370, cW - 140, cH - 80, 0.05f, 0.08f, 0.12f, 0.95f);
 
-            std::ostringstream tstr; tstr << "HEAD TILT: " << std::fixed << std::setprecision(1) << tilt << " DEG";
-            AddCanvasText(rawVerts, tstr.str(), 170, 490, 4.5f, 0.8f, 0.85f, 0.9f);
+            std::ostringstream s1; s1 << "ROTATION SPEED: " << std::fixed << std::setprecision(0) << rotSpeed << " DEG/S  |  FRAME: " << ModelFrameName(angModel);
+            AddCanvasText(rawVerts, s1.str(), 170, 400, 4.2f, 0.8f, 0.85f, 0.9f);
 
-            std::ostringstream sstr; sstr << "HEAD ROTATION SPEED (DERIVED): " << std::fixed << std::setprecision(0) << speed << " DEG/S";
-            AddCanvasText(rawVerts, sstr.str(), 170, 550, 4.5f, 0.8f, 0.85f, 0.9f);
+            std::ostringstream s2; s2 << "TRANSLATION SPEED: " << std::fixed << std::setprecision(2) << linSpeed << " M/S  |  FRAME: " << ModelFrameName(linModel);
+            AddCanvasText(rawVerts, s2.str(), 170, 460, 4.2f, 0.8f, 0.85f, 0.9f);
 
-            std::ostringstream cstr;
-            cstr << "CONTROLLER REPORTED VELOCITY: " << std::fixed << std::setprecision(0) << ctrlSpeed << " DEG/S "
-                 << (ctrlActive ? "[ACTIVE/REPORTING]" : "[IDLE]");
-            AddCanvasText(rawVerts, cstr.str(), 170, 610, 4.5f, ctrlActive ? 0.3f : 1.0f, ctrlActive ? 1.0f : 0.7f, 0.4f);
+            std::ostringstream s3;
+            s3 << "PREDICTION ERROR: WITH VEL=" << std::fixed << std::setprecision(1) << linPredErr << "mm  vs  ZERO VEL=" << linZeroErr << "mm";
+            AddCanvasText(rawVerts, s3.str(), 170, 520, 4.2f, (linPredErr > linZeroErr * 1.3f) ? 1.0f : 0.4f, (linPredErr > linZeroErr * 1.3f) ? 0.3f : 1.0f, 0.4f);
 
-            AddCanvasText(rawVerts, "HMD VELOCITY STATUS:", 170, 670, 4.5f, 0.8f, 0.85f, 0.9f);
-            if(zeroVelEvents > 5 && speed > 20.0f) {
-                AddCanvasRect(rawVerts, 720, 660, 1400, 710, 0.85f, 0.15f, 0.15f, 0.95f);
-                AddCanvasText(rawVerts, "BUG: 0 VELOCITY REPORTED!", 740, 672, 4.5f, 1.0f, 1.0f, 1.0f);
-            } else if(model < 0) {
-                AddCanvasRect(rawVerts, 720, 660, 1400, 710, 0.90f, 0.40f, 0.10f, 0.95f);
-                AddCanvasText(rawVerts, "BUG: LOCAL VELOCITY FRAME!", 740, 672, 4.5f, 1.0f, 1.0f, 1.0f);
-            } else if(model > 0) {
-                AddCanvasRect(rawVerts, 720, 660, 1200, 710, 0.15f, 0.65f, 0.25f, 0.95f);
-                AddCanvasText(rawVerts, "WORLD (COMPLIANT)", 740, 672, 4.5f, 1.0f, 1.0f, 1.0f);
-            } else {
-                AddCanvasText(rawVerts, "STATIONARY / LOW SPEED", 720, 670, 4.5f, 0.6f, 0.6f, 0.7f);
-            }
+            std::ostringstream estr;
+            estr << "ISSUES: ZERO-ANG: " << zeroVelEvents << " | AV-FRAME: " << avFrameEvents
+                 << " | ZERO-LIN: " << zeroLinVelEvents << " | LIN-OVERSHOOT: " << linOvershootEvents;
+            AddCanvasText(rawVerts, estr.str(), 170, 600, 4.0f, (avFrameEvents > 0) ? 1.0f : 0.7f, (avFrameEvents > 0) ? 0.3f : 0.8f, 0.4f);
 
-            std::ostringstream estr; estr << "DISCREPANCIES LOGGED: " << totalIssues << " (ZERO-VEL: " << zeroVelEvents << ", TILT-FAIL: " << tiltEvents << ")";
-            AddCanvasText(rawVerts, estr.str(), 170, 730, 4.5f, (totalIssues > 10) ? 1.0f : 0.7f, (totalIssues > 10) ? 0.4f : 0.8f, 0.4f);
+            AddCanvasText(rawVerts, "[KEYS: 1=90fps, 2=45fps, 3=60fps, 4=drops, 5=90<->60 sweep]", 170, 660, 3.8f, 0.5f, 0.7f, 0.9f);
         }
         else if(state == TestState::Finished) {
-            const bool hasBug = (bugType != DriverBugType::None);
-            AddCanvasRect(rawVerts, 130, 190, cW - 130, 290, hasBug ? 0.45f : 0.10f, hasBug ? 0.10f : 0.40f, 0.10f, 0.9f);
-            if(bugType == DriverBugType::ZeroVelocityOmission) {
-                AddCanvasText(rawVerts, "VERDICT: PICO ZERO-VELOCITY BUG CONFIRMED!", 160, 220, 5.8f, 1.0f, 0.9f, 0.2f);
-            } else if(bugType == DriverBugType::LocalFrameMismatch) {
-                AddCanvasText(rawVerts, "VERDICT: PICO LOCAL-UP FRAME BUG CONFIRMED!", 160, 220, 5.8f, 1.0f, 0.9f, 0.2f);
-            } else {
-                AddCanvasText(rawVerts, "VERDICT: TRACKING OK (WORLD VELOCITY COMPLIANT)", 160, 220, 5.8f, 0.4f, 1.0f, 0.6f);
-            }
+            AddCanvasRect(rawVerts, 130, 170, cW - 130, 260, 0.10f, 0.30f, 0.50f, 0.9f);
+            AddCanvasText(rawVerts, "AUDIT COMPLETE — 6DOF PREDICTION REPORT", 160, 195, 5.5f, 1.0f, 1.0f, 1.0f);
 
-            AddCanvasText(rawVerts, "HARDENED MULTI-PATH AUDIT SUMMARY:", 160, 330, 4.8f, 0.8f, 0.9f, 1.0f);
-            std::ostringstream r1; r1 << "- 5 OPENVR RETRIEVAL PATHWAYS: ALL 5 REPORT REAL-TIME WORLD VELOCITY";
-            AddCanvasText(rawVerts, r1.str(), 160, 390, 4.2f, 0.3f, 1.0f, 0.5f);
-            std::ostringstream r2; r2 << "- CONTROLLER VS HMD COMPARISON: BOTH HMD & CONTROLLERS REPORT VELOCITY";
-            AddCanvasText(rawVerts, r2.str(), 160, 440, 4.2f, 0.3f, 1.0f, 0.5f);
-            std::ostringstream r3; r3 << "- ZERO-VELOCITY OMISSIONS ON HMD: " << zeroVelEvents;
-            AddCanvasText(rawVerts, r3.str(), 160, 490, 4.5f, 0.85f, 0.9f, 0.95f);
+            AddCanvasText(rawVerts, "FINDINGS & DIAGNOSTIC SUMMARY:", 160, 300, 4.5f, 0.8f, 0.9f, 1.0f);
+            std::ostringstream r0; r0 << "- TILTED HEADSET-UP FAULTS (AV_FRAME_BUG): " << avFrameEvents;
+            AddCanvasText(rawVerts, r0.str(), 160, 350, 4.2f, (avFrameEvents > 0) ? 1.0f : 0.3f, (avFrameEvents > 0) ? 0.3f : 1.0f, 0.4f);
+
+            std::ostringstream r1; r1 << "- ZERO LINEAR VELOCITY EVENTS: " << zeroLinVelEvents;
+            AddCanvasText(rawVerts, r1.str(), 160, 400, 4.0f, 0.85f, 0.9f, 0.95f);
+
+            std::ostringstream r2; r2 << "- LINEAR EXTRAPOLATION OVERSHOOT EVENTS: " << linOvershootEvents;
+            AddCanvasText(rawVerts, r2.str(), 160, 450, 4.0f, (linOvershootEvents > 50) ? 1.0f : 0.4f, (linOvershootEvents > 50) ? 0.4f : 1.0f, 0.4f);
 
             char logBuf[256];
             {
                 std::lock_guard<std::mutex> lk(const_cast<AtomicHud&>(hud).dirMtx);
                 std::strncpy(logBuf, hud.lastRunDir, sizeof(logBuf));
             }
-            std::ostringstream r4; r4 << "- FULL LOGS SAVED IN: " << logBuf;
-            AddCanvasText(rawVerts, r4.str(), 160, 550, 4.0f, 0.6f, 0.9f, 0.6f);
-            AddCanvasText(rawVerts, "SUMMARY SAVED TO summary.txt & tracking_errors.csv", 160, 610, 4.5f, 1.0f, 0.85f, 0.3f);
-
-            AddCanvasRect(rawVerts, 140, cH - 210, cW - 140, cH - 100, 0.15f, 0.35f, 0.75f, 0.9f);
-            AddCanvasText(rawVerts, "SQUEEZE TRIGGER TO RUN BENCHMARK AGAIN", 240, cH - 170, 5.5f, 1.0f, 1.0f, 1.0f);
+            std::ostringstream r4; r4 << "- FULL LOGS IN: " << logBuf;
+            AddCanvasText(rawVerts, r4.str(), 160, 510, 3.8f, 0.6f, 0.9f, 0.6f);
+            AddCanvasText(rawVerts, "PRESS TRIGGER TO RUN BENCHMARK AGAIN", 240, cH - 150, 5.0f, 1.0f, 1.0f, 1.0f);
         }
 
         const size_t vertexCount = rawVerts.size();
         if(vertexCount * 2 > vertexCapacity_) return false;
 
         const float ipdDisparityShift = 0.021f;
-
         for(size_t i=0; i<vertexCount; ++i) {
             Vertex v = rawVerts[i];
             v.x += ipdDisparityShift;
@@ -664,10 +710,6 @@ public:
         vr::Texture_t right{&rightData, vr::TextureType_DirectX12, vr::ColorSpace_Gamma};
 
         {
-            // compositor->Submit() touches the same IVRCompositor connection that
-            // the sampler thread's IVRSystem pose queries and the main loop's
-            // WaitGetPoses/PollNextEvent calls use. Serialize it against the
-            // sampler thread via gVrApiMutex for the same reason as those calls.
             std::lock_guard<std::mutex> vrLock(gVrApiMutex);
             compositor_->Submit(vr::Eye_Left, &left, nullptr, vr::Submit_Default);
             compositor_->Submit(vr::Eye_Right, &right, nullptr, vr::Submit_Default);
@@ -787,6 +829,13 @@ private:
 };
 
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN) {
+        if (wParam == '1') { gDynamicSweepActive.store(false); gTargetSimFps.store(90.0f); std::cout << "\n[FPS Mode] 90 FPS (Clean)\n"; }
+        if (wParam == '2') { gDynamicSweepActive.store(false); gTargetSimFps.store(45.0f); std::cout << "\n[FPS Mode] 45 FPS (Reprojecting 2x)\n"; }
+        if (wParam == '3') { gDynamicSweepActive.store(false); gTargetSimFps.store(60.0f); std::cout << "\n[FPS Mode] 60 FPS (Sub-90 Jitter)\n"; }
+        if (wParam == '4') { gDynamicSweepActive.store(false); gTargetSimFps.store(12.0f); std::cout << "\n[FPS Mode] 12 FPS (Simulating 84ms Stalls)\n"; }
+        if (wParam == '5') { gDynamicSweepActive.store(true); std::cout << "\n[FPS Mode] Dynamic Sweep (90 <-> 60 FPS ramp, 1 FPS/sec)\n"; }
+    }
     if (msg == WM_CLOSE || msg == WM_DESTROY) {
         gRunning.store(false);
         return 0;
@@ -798,8 +847,6 @@ static bool PollInputTrigger(vr::IVRSystem* vrSystem) {
     if((GetAsyncKeyState(VK_SPACE) & 0x8000) || (GetAsyncKeyState(VK_RETURN) & 0x8000)) return true;
     if(!vrSystem) return false;
 
-    // Also touches IVRSystem from the main thread; guarded for the same
-    // cross-thread reason as the other vrSystem/compositor call sites.
     std::lock_guard<std::mutex> vrLock(gVrApiMutex);
     for(vr::TrackedDeviceIndex_t i = 1; i < vr::k_unMaxTrackedDeviceCount; ++i) {
         if(vrSystem->GetTrackedDeviceClass(i) == vr::TrackedDeviceClass_Controller) {
@@ -825,7 +872,7 @@ static void PromptExit(int code) {
     std::getline(std::cin, line);
 }
 
-int main(int, char**) {
+int main(int argc, char** argv) {
     DisableProcessWindowsGhosting();
 
     ScopedTimerResolution timerRes;
@@ -835,8 +882,47 @@ int main(int, char**) {
     try { fs::create_directories(logRootDir); } catch(...) {}
 
     std::cout << "======================================================\n";
-    std::cout << "  Pico 4 OpenVR Multi-Pathway Velocity Audit Tool     \n";
+    std::cout << "  Pico 4 OpenVR 6DOF Prediction & Warping Benchmark   \n";
     std::cout << "======================================================\n";
+
+    float initialFps = 90.0f;
+    bool initialSweep = false;
+
+    if(argc > 1) {
+        for(int i = 1; i < argc; ++i) {
+            if(std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+                std::string argVal = argv[++i];
+                if(argVal == "sweep") {
+                    initialSweep = true;
+                } else {
+                    initialFps = std::stof(argVal);
+                }
+            }
+        }
+    } else {
+        std::cout << "\nChoose simulated rendering rate for the test:\n"
+                  << "  [1] 90 FPS        (Standard clean rendering)\n"
+                  << "  [2] 45 FPS        (Constant 2x Reprojection — War Thunder drop)\n"
+                  << "  [3] 60 FPS        (Irregular dropped vsyncs)\n"
+                  << "  [4] 12 FPS        (Simulate ~84ms stall episodes)\n"
+                  << "  [5] Dynamic Sweep (90 <-> 60 FPS gradual wave, 1 FPS/sec)\n"
+                  << "Select [1-5] (default 1): " << std::flush;
+
+        std::string choice;
+        std::getline(std::cin, choice);
+        if(!choice.empty()) {
+            if(choice[0] == '2') initialFps = 45.0f;
+            else if(choice[0] == '3') initialFps = 60.0f;
+            else if(choice[0] == '4') initialFps = 12.0f;
+            else if(choice[0] == '5') initialSweep = true;
+        }
+    }
+
+    gTargetSimFps.store(initialFps);
+    gDynamicSweepActive.store(initialSweep);
+
+    std::cout << "[Config] Mode: " << (initialSweep ? "Dynamic Sweep (90 <-> 60 FPS)" : (std::to_string((int)initialFps) + " FPS")) << "\n"
+              << "[Tip] Switch modes live anytime using keys 1-5 on your PC keyboard!\n\n";
 
     WNDCLASSEXW wc{sizeof(WNDCLASSEXW), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandleW(nullptr), nullptr, nullptr, nullptr, nullptr, L"Pico4VRMotionTestClass", nullptr};
     RegisterClassExW(&wc);
@@ -888,7 +974,7 @@ int main(int, char**) {
         return 3;
     }
 
-    std::cout << "\n[Ready] Multi-path audit active in VR.\n";
+    std::cout << "\n[Ready] Full 6DOF audit active in VR.\n";
 
     AtomicHud hud;
     std::mutex historyMutex;
@@ -896,33 +982,50 @@ int main(int, char**) {
 
     std::thread sampler([&]{
         std::unique_ptr<std::ofstream> csv;
+        std::unique_ptr<std::ofstream> incidentCsv;
         std::unique_ptr<std::ofstream> summary;
         fs::path currentRunDir;
 
         TestState state = TestState::Countdown;
         double stateStartTime = 0.0;
-        int uprightIssues = 0;
-        int tiltedIssues = 0;
         int zeroVelIssues = 0;
+        int avFrameIssues = 0;
+        int zeroLinVelIssues = 0;
+        int linOvershootIssues = 0;
         int totalLoggedSamples = 0;
+        int totalIncidentsDetected = 0;
 
-        // Denominator counters, tracked separately per bug-class so the >5%
-        // failure-rate threshold below is computed against only the samples
-        // where that failure mode is actually *possible* to observe, instead
-        // of against every logged sample (which includes long stationary /
-        // low-speed stretches where e.g. a zero-velocity omission isn't
-        // meaningful/expected). See the restart block for where these are
-        // cleared alongside the other per-run counters.
-        int highSpeedSamples = 0;      // currentSpeedDegS > 15.0 (zero-vel bug denominator)
-        int tiltEligibleSamples = 0;   // tilt > 15.0 && reportedSpeedDegS >= 10.0 (local-frame bug denominator)
-        int uprightEligibleSamples = 0; // Phase1 samples with reportedSpeedDegS >= 10.0 (prediction-fault denominator)
+        int highRotSpeedSamples = 0;
+        int tiltEligibleSamples = 0;
+        int highLinSpeedSamples = 0;
 
-        uint64_t auditInstantZeroCount = 0;
-        uint64_t auditPredZeroCount = 0;
-        uint64_t auditRawSpaceZeroCount = 0;
-        uint64_t auditRenderZeroCount = 0;
-        uint64_t auditGameZeroCount = 0;
-        uint64_t auditControllerActiveCount = 0;
+        uint64_t auditInstantLinZeroCount = 0;
+        uint64_t auditPredLinZeroCount = 0;
+        uint64_t auditRenderLinZeroCount = 0;
+
+        // Phase Breakdown Telemetry
+        struct PhaseStats {
+            int totalSamples = 0;
+            int highRotSamples = 0;
+            int tiltEligibleSamples = 0;
+            int highLinSamples = 0;
+            int avFrameIssues = 0;
+            int zeroLinVelIssues = 0;
+            int linOvershootIssues = 0;
+            int snapbackCount = 0;
+            double totalSnapbackDistMm = 0.0;
+            int duplicateCount = 0;
+
+            // Granular Snapback Bins (< 1mm, 1-2mm, > 2mm)
+            int snapSub1mm = 0;
+            int snap1to2mm = 0;
+            int snapOver2mm = 0;
+        } p1Stats, p2Stats, p3Stats;
+
+        std::deque<LogEntry> preIncidentBuffer;
+        bool inIncident = false;
+        int currentIncidentId = 0;
+        int postRecoveryRemaining = 0;
 
         const auto start = std::chrono::steady_clock::now();
         Sample prev{};
@@ -936,41 +1039,25 @@ int main(int, char**) {
             vr::TrackedDevicePose_t posesPred[vr::k_unMaxTrackedDeviceCount]{};
             vr::TrackedDevicePose_t posesRawSpace[vr::k_unMaxTrackedDeviceCount]{};
             {
-                // These three calls form one logical "sample" and are also the
-                // sampler thread's only entry points into IVRSystem, which the
-                // main thread calls concurrently (PollNextEvent, WaitGetPoses,
-                // GetTrackedDeviceIndexForControllerRole, PollInputTrigger, and
-                // compositor->Submit). OpenVR does not document IVRSystem /
-                // IVRCompositor as safe to call simultaneously from multiple
-                // threads, so gVrApiMutex serializes all of these call sites
-                // as a mitigation.
-                //
-                // Deliberate exception: compositor->WaitGetPoses() on the main
-                // thread is NOT covered by this lock. It's designed to block
-                // until the compositor's "running start" signal, and holding
-                // this mutex across that wait would stall the sampler thread
-                // for up to a full frame period on every main-loop iteration,
-                // collapsing its whole reason for existing (dense, frame-rate-
-                // independent ground-truth sampling for the audit). Leaving it
-                // unlocked keeps a narrow residual race between WaitGetPoses
-                // and these calls; if that residual risk needs to be closed
-                // too, the sampler would need to stop calling IVRSystem
-                // directly and instead read poses handed off from the main
-                // thread (a larger architectural change than a mutex).
                 std::lock_guard<std::mutex> vrLock(gVrApiMutex);
                 vrSystem->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, posesInstant, vr::k_unMaxTrackedDeviceCount);
                 vrSystem->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0111f, posesPred, vr::k_unMaxTrackedDeviceCount);
                 vrSystem->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseRawAndUncalibrated, 0.0f, posesRawSpace, vr::k_unMaxTrackedDeviceCount);
             }
 
-            Vec3 renderOmega{}, gameOmega{}, ctrlLOmega{}, ctrlROmega{};
+            Vec3 renderOmega{}, gameOmega{}, renderVel{}, gameVel{};
+            Vec3 ctrlLOmega{}, ctrlROmega{}, ctrlLVel{}, ctrlRVel{};
             bool ctrlLValid = false, ctrlRValid = false;
             {
                 std::lock_guard<std::mutex> lk(gRenderPosesMutex);
                 renderOmega = gCompositorRenderOmega;
                 gameOmega = gCompositorGameOmega;
+                renderVel = gCompositorRenderVel;
+                gameVel = gCompositorGameVel;
                 ctrlLOmega = gControllerLeftOmega;
                 ctrlROmega = gControllerRightOmega;
+                ctrlLVel = gControllerLeftVel;
+                ctrlRVel = gControllerRightVel;
                 ctrlLValid = gControllerLeftValid;
                 ctrlRValid = gControllerRightValid;
             }
@@ -985,13 +1072,39 @@ int main(int, char**) {
             s.result = p.eTrackingResult;
             s.poseValid = p.bPoseIsValid;
 
+            if (havePrev) {
+                s.sampleDt = s.t - prev.t;
+                s.stepDelta = s.p - prev.p;
+                s.stepDistMm = Length(s.stepDelta) * 1000.0;
+                s.stepSpeedMs = (s.sampleDt > 1e-6) ? (s.stepDistMm / (s.sampleDt * 1000.0)) : 0.0;
+                s.isDuplicateCall = (s.sampleDt < 0.0005 && s.stepDistMm < 0.01);
+
+                // Snap-back detection: step displacement opposes reported motion velocity by > 0.5mm
+                if (Length(s.velocity) > 0.08) {
+                    const double velProj = Dot(s.stepDelta, Normalize(s.velocity));
+                    if (velProj < -0.0005) {
+                        s.isSnapback = true;
+                        s.snapbackMagMm = std::abs(velProj) * 1000.0;
+                    }
+                }
+            }
+
             s.audit.sysInstantOmega = s.omega;
             s.audit.sysPredOmega = ReportedAngular(posesPred[0]);
             s.audit.sysRawSpaceOmega = ReportedAngular(posesRawSpace[0]);
             s.audit.waitGetRenderOmega = renderOmega;
             s.audit.waitGetGameOmega = gameOmega;
+
+            s.audit.sysInstantVel = s.velocity;
+            s.audit.sysPredVel = ReportedLinear(posesPred[0]);
+            s.audit.sysRawSpaceVel = ReportedLinear(posesRawSpace[0]);
+            s.audit.waitGetRenderVel = renderVel;
+            s.audit.waitGetGameVel = gameVel;
+
             s.audit.ctrlLeftOmega = ctrlLOmega;
             s.audit.ctrlRightOmega = ctrlROmega;
+            s.audit.ctrlLeftVel = ctrlLVel;
+            s.audit.ctrlRightVel = ctrlRVel;
             s.audit.ctrlLeftValid = ctrlLValid;
             s.audit.ctrlRightValid = ctrlRValid;
 
@@ -999,30 +1112,31 @@ int main(int, char**) {
             hud.trackingOk.store(s.poseValid && s.result==vr::TrackingResult_Running_OK);
             hud.tiltDeg.store(static_cast<float>(curTilt));
 
-            const double ctrlMaxSpeed = std::max(Length(ctrlLOmega), Length(ctrlROmega)) * kRadToDeg;
-            hud.ctrlSpeedDegS.store(static_cast<float>(ctrlMaxSpeed));
-            hud.ctrlActive.store((ctrlLValid || ctrlRValid) && ctrlMaxSpeed > 5.0);
-
             if(gRestartBenchmark.exchange(false)) {
                 state = TestState::Countdown;
                 stateStartTime = t;
-                uprightIssues = 0;
-                tiltedIssues = 0;
                 zeroVelIssues = 0;
+                avFrameIssues = 0;
+                zeroLinVelIssues = 0;
+                linOvershootIssues = 0;
                 totalLoggedSamples = 0;
-                highSpeedSamples = 0;
+                totalIncidentsDetected = 0;
+                highRotSpeedSamples = 0;
                 tiltEligibleSamples = 0;
-                uprightEligibleSamples = 0;
-                auditInstantZeroCount = 0;
-                auditPredZeroCount = 0;
-                auditRawSpaceZeroCount = 0;
-                auditRenderZeroCount = 0;
-                auditGameZeroCount = 0;
-                auditControllerActiveCount = 0;
+                highLinSpeedSamples = 0;
+                auditInstantLinZeroCount = 0;
+                auditPredLinZeroCount = 0;
+                auditRenderLinZeroCount = 0;
+                p1Stats = {}; p2Stats = {}; p3Stats = {};
+                inIncident = false;
+                currentIncidentId = 0;
+                postRecoveryRemaining = 0;
+                preIncidentBuffer.clear();
                 hud.totalIssues.store(0);
-                hud.tiltEvents.store(0);
                 hud.zeroVelEvents.store(0);
-                hud.bugType.store(DriverBugType::None);
+                hud.avFrameEvents.store(0);
+                hud.zeroLinVelEvents.store(0);
+                hud.linOvershootEvents.store(0);
             }
 
             if(state == TestState::Countdown) {
@@ -1036,13 +1150,16 @@ int main(int, char**) {
                     currentRunDir = logRootDir / ("run_" + std::to_string(nowMs));
                     fs::create_directories(currentRunDir);
                     csv = std::make_unique<std::ofstream>(currentRunDir / "tracking_errors.csv");
-                    WriteCsvHeader(*csv);
+                    WriteCsvHeader(*csv, false);
+
+                    incidentCsv = std::make_unique<std::ofstream>(currentRunDir / "incident_transitions.csv");
+                    WriteCsvHeader(*incidentCsv, true);
 
                     {
                         std::lock_guard<std::mutex> lk(hud.dirMtx);
                         std::strncpy(hud.lastRunDir, currentRunDir.string().c_str(), sizeof(hud.lastRunDir)-1);
                     }
-                    std::cout << "[Benchmark] Phase 1 Started! Logging to: " << currentRunDir << "\n";
+                    std::cout << "[Benchmark] Phase 1: Upright Rotation Test started\n";
                 }
             }
             else if(state == TestState::Phase1_Upright) {
@@ -1051,56 +1168,69 @@ int main(int, char**) {
                 if(elapsed >= 10.0) {
                     state = TestState::Phase2_Tilted;
                     stateStartTime = t;
-                    std::cout << "[Benchmark] Phase 2 Started! (Tilt Head Test)\n";
+                    std::cout << "[Benchmark] Phase 2: Tilted Rotation Test started\n";
                 }
             }
             else if(state == TestState::Phase2_Tilted) {
                 const double elapsed = t - stateStartTime;
                 hud.stateTimer.store(static_cast<float>(std::max(0.0, 15.0 - elapsed)));
                 if(elapsed >= 15.0) {
+                    state = TestState::Phase3_Leaning;
+                    stateStartTime = t;
+                    std::cout << "[Benchmark] Phase 3: Translational Lean & Surge (Z-axis) started\n";
+                }
+            }
+            else if(state == TestState::Phase3_Leaning) {
+                const double elapsed = t - stateStartTime;
+                hud.stateTimer.store(static_cast<float>(std::max(0.0, 15.0 - elapsed)));
+                if(elapsed >= 15.0) {
                     state = TestState::Finished;
-                    DriverBugType finalBug = DriverBugType::None;
-
-                    // Statistical significance check: Bug requires > 5% true failure rate,
-                    // measured against only the samples where the failure mode could have
-                    // been observed (not every logged sample -- see counter comments above).
-                    const int minZeroVelThreshold = std::max(50, static_cast<int>(highSpeedSamples * 0.05));
-                    const int minTiltThreshold = std::max(50, static_cast<int>(tiltEligibleSamples * 0.05));
-                    if(zeroVelIssues >= minZeroVelThreshold) finalBug = DriverBugType::ZeroVelocityOmission;
-                    else if(tiltedIssues >= minTiltThreshold) finalBug = DriverBugType::LocalFrameMismatch;
-                    hud.bugType.store(finalBug);
-
                     if(csv) csv->close();
+                    if(incidentCsv) incidentCsv->close();
                     summary = std::make_unique<std::ofstream>(currentRunDir / "summary.txt");
                     if(summary) {
                         *summary << "======================================================================\n"
-                                 << "PICO 4 OPENVR MULTI-PATHWAY VELOCITY AUDIT REPORT\n"
+                                 << "PICO 4 OPENVR 6DOF VELOCITY, WARPING & PREDICTION REPORT\n"
                                  << "======================================================================\n"
                                  << "Tracking System:          " << trackingSystem << "\n"
-                                 << "Model:                    " << model << "\n"
-                                 << "Serial:                   " << serial << "\n"
-                                 << "Driver Version:           " << driverVer << "\n"
-                                 << "Display Frequency:        " << displayFreq << " Hz\n\n"
-                                 << "FINAL VERDICT:            " << (finalBug == DriverBugType::ZeroVelocityOmission ? "ZERO-VELOCITY BUG CONFIRMED (Driver omits angular velocity)" :
-                                                                  (finalBug == DriverBugType::LocalFrameMismatch ? "LOCAL-UP FRAME BUG CONFIRMED (Velocity in wrong coordinate frame)" : "TRACKING NORMAL (WORLD VELOCITY COMPLIANT)")) << "\n\n"
-                                 << "API PATHWAY VELOCITY AUDIT (of " << highSpeedSamples << " high-speed samples):\n"
-                                 << "1. IVRSystem (Instantaneous 0.0s):        " << auditInstantZeroCount << " / " << highSpeedSamples << " samples zeroed\n"
-                                 << "2. IVRSystem (Forward Predicted +11.1ms): " << auditPredZeroCount << " / " << highSpeedSamples << " samples zeroed\n"
-                                 << "3. IVRSystem (RawUncalibrated Space):     " << auditRawSpaceZeroCount << " / " << highSpeedSamples << " samples zeroed\n"
-                                 << "4. IVRCompositor (WaitGetPoses Render):   " << auditRenderZeroCount << " / " << highSpeedSamples << " samples zeroed\n"
-                                 << "5. IVRCompositor (GetLastPoses Game):     " << auditGameZeroCount << " / " << highSpeedSamples << " samples zeroed\n\n"
-                                 << "HARDWARE CONTROL TEST (CONTROLLER VS HMD):\n"
-                                 << "- Controller Velocity Events Recorded:   " << auditControllerActiveCount << " samples\n"
-                                 << "- Result: Both HMD and Controllers report active velocity vectors in World tracking space.\n\n"
-                                 << "METRIC TOTALS:\n"
-                                 << "- Total Samples Logged:                   " << totalLoggedSamples << "\n"
-                                 << "- Upright Prediction Faults:              " << uprightIssues << " / " << uprightEligibleSamples << " (" << (uprightEligibleSamples > 0 ? (uprightIssues * 100 / uprightEligibleSamples) : 0) << "%)\n"
-                                 << "- Zero-Velocity Omissions on HMD:         " << zeroVelIssues << " / " << highSpeedSamples << " (" << (highSpeedSamples > 0 ? (zeroVelIssues * 100 / highSpeedSamples) : 0) << "%)\n"
-                                 << "- Tilted Local-Frame Faults:              " << tiltedIssues << " / " << tiltEligibleSamples << " (" << (tiltEligibleSamples > 0 ? (tiltedIssues * 100 / tiltEligibleSamples) : 0) << "%)\n"
+                                 << "Model:                    " << model << " | Driver: " << driverVer << "\n"
+                                 << "Simulated FPS Mode:       " << (gDynamicSweepActive.load() ? "Dynamic Sweep (90 <-> 60 FPS)" : (std::to_string((int)gTargetSimFps.load()) + " FPS")) << "\n\n"
+                                 << "TOTAL SAMPLES LOGGED:     " << totalLoggedSamples << "\n"
+                                 << "TOTAL INCIDENT EPISODES:  " << totalIncidentsDetected << " (Captured in incident_transitions.csv)\n\n"
+                                 << "OVERALL ROTATIONAL AUDIT (of " << highRotSpeedSamples << " high-rot-speed samples):\n"
+                                 << "- Zero Angular Velocity Events:           " << zeroVelIssues << "\n"
+                                 << "- Tilted Headset-Up Faults (AV_FRAME_BUG):" << avFrameIssues << " / " << tiltEligibleSamples << " (" << (tiltEligibleSamples > 0 ? (avFrameIssues * 100 / tiltEligibleSamples) : 0) << "%)\n\n"
+                                 << "OVERALL TRANSLATIONAL AUDIT (of " << highLinSpeedSamples << " high-linear-speed samples):\n"
+                                 << "- Zero Linear Velocity Events:            " << zeroLinVelIssues << " / " << highLinSpeedSamples << " (" << (highLinSpeedSamples > 0 ? (zeroLinVelIssues * 100 / highLinSpeedSamples) : 0) << "%)\n"
+                                 << "- Extrapolation Overshoot Events:         " << linOvershootIssues << " / " << highLinSpeedSamples << " (" << (highLinSpeedSamples > 0 ? (linOvershootIssues * 100 / highLinSpeedSamples) : 0) << "%)\n\n"
+                                 << "API PATHWAY LINEAR VELOCITY AUDIT:\n"
+                                 << "1. IVRSystem Instantaneous:               " << auditInstantLinZeroCount << " / " << highLinSpeedSamples << " zeroed\n"
+                                 << "2. IVRSystem Predicted:                   " << auditPredLinZeroCount << " / " << highLinSpeedSamples << " zeroed\n"
+                                 << "3. IVRCompositor WaitGetPoses:            " << auditRenderLinZeroCount << " / " << highLinSpeedSamples << " zeroed\n\n"
+                                 << "======================================================================\n"
+                                 << "PER-PHASE DETAILED BREAKDOWN\n"
+                                 << "======================================================================\n"
+                                 << "PHASE 1: UPRIGHT ROTATION\n"
+                                 << "- Total Samples:       " << p1Stats.totalSamples << "\n"
+                                 << "- High-Rot Samples:    " << p1Stats.highRotSamples << "\n"
+                                 << "- Duplicate Pose Hits: " << p1Stats.duplicateCount << "\n\n"
+                                 << "PHASE 2: TILTED ROTATION (>25 DEG TILT)\n"
+                                 << "- Total Samples:       " << p2Stats.totalSamples << "\n"
+                                 << "- Tilt Eligible:       " << p2Stats.tiltEligibleSamples << "\n"
+                                 << "- AV_FRAME_BUG Count:  " << p2Stats.avFrameIssues << " (" << (p2Stats.tiltEligibleSamples > 0 ? (p2Stats.avFrameIssues * 100 / p2Stats.tiltEligibleSamples) : 0) << "%)\n\n"
+                                 << "PHASE 3: TRANSLATIONAL LEANING & SURGE\n"
+                                 << "- Total Samples:       " << p3Stats.totalSamples << "\n"
+                                 << "- High-Linear Samples: " << p3Stats.highLinSamples << "\n"
+                                 << "- Overshoot Errors:    " << p3Stats.linOvershootIssues << " (" << (p3Stats.highLinSamples > 0 ? (p3Stats.linOvershootIssues * 100 / p3Stats.highLinSamples) : 0) << "%)\n"
+                                 << "- Snap-Back Events:    " << p3Stats.snapbackCount << " (Total Snapback: " << std::fixed << std::setprecision(2) << p3Stats.totalSnapbackDistMm << " mm)\n"
+                                 << "  * < 1.0 mm (Sub-frame jitter):  " << p3Stats.snapSub1mm << "\n"
+                                 << "  * 1.0 - 2.0 mm (Horizon error): " << p3Stats.snap1to2mm << "\n"
+                                 << "  * > 2.0 mm (Severe snapback):   " << p3Stats.snapOver2mm << "\n"
+                                 << "- Duplicate Pose Hits: " << p3Stats.duplicateCount << "\n"
                                  << "======================================================================\n";
                         summary->close();
                     }
-                    std::cout << "[Benchmark] Complete! Audit report written to: " << currentRunDir << "\n";
+                    std::cout << "[Benchmark] Complete! Report & incident transitions saved to: " << currentRunDir << "\n";
                 }
             }
 
@@ -1112,15 +1242,16 @@ int main(int, char**) {
                 while(history.size() > 1500) history.pop_front();
             }
 
-            double accelJump = 0;
-            if(havePrev) {
-                const double dt = std::max(1e-5, s.t - prev.t);
-                accelJump = Length(s.omega - prev.omega) / dt * kRadToDeg;
-            }
-
             Sample base{};
             bool haveBase = false;
-            const double target = t - 0.0111;
+
+            // Dynamic evaluation horizon: scales with simulated FPS instead of fixed 90Hz
+            const float curTargetFps = gTargetSimFps.load();
+            const double evalHorizon = (curTargetFps >= 10.0f && curTargetFps <= 150.0f)
+                                       ? (1.0 / static_cast<double>(curTargetFps))
+                                       : 0.0111;
+            const double target = t - evalHorizon;
+
             {
                 std::lock_guard<std::mutex> lk(historyMutex);
                 double best = 1e9;
@@ -1139,12 +1270,10 @@ int main(int, char**) {
                 const double dt = s.t - base.t;
                 const double tilt = TiltFromQuat(base.q);
 
+                // 1. Angular Ground Truth
                 Quat dqLocal = QNormalize(QMul(QConj(base.q), s.q));
                 if(dqLocal.w < 0.0) {
-                    dqLocal.w = -dqLocal.w;
-                    dqLocal.x = -dqLocal.x;
-                    dqLocal.y = -dqLocal.y;
-                    dqLocal.z = -dqLocal.z;
+                    dqLocal.w = -dqLocal.w; dqLocal.x = -dqLocal.x; dqLocal.y = -dqLocal.y; dqLocal.z = -dqLocal.z;
                 }
                 const double halfW = std::clamp(dqLocal.w, 0.0, 1.0);
                 const double angle = 2.0 * std::acos(halfW);
@@ -1153,98 +1282,158 @@ int main(int, char**) {
                 if(sn > 1e-6) axis = axis * (1.0 / sn);
                 else axis = {0, 0, 0};
 
-                const Vec3 measuredLocal = axis * (angle / dt);
-                const Vec3 measuredWorldOmega = QRotate(base.q, measuredLocal);
+                const Vec3 derivedLocalOmega = axis * (angle / dt);
+                const Vec3 derivedWorldOmega = QRotate(base.q, derivedLocalOmega);
 
-                const double currentSpeedDegS = Length(measuredWorldOmega) * kRadToDeg;
-                hud.speedDegS.store(static_cast<float>(currentSpeedDegS));
-                const double reportedSpeedDegS = Length(base.omega) * kRadToDeg;
+                const double rotSpeedDegS = Length(derivedWorldOmega) * kRadToDeg;
+                hud.speedDegS.store(static_cast<float>(rotSpeedDegS));
 
-                const double worldErr = Length(base.omega - measuredWorldOmega) * kRadToDeg;
-                const double localErr = Length(base.omega - measuredLocal) * kRadToDeg;
-                
-                // Disambiguation: +1 = World preferred, -1 = Local preferred (Bug), 0 = Ambiguous
-                const int modelMatch = (reportedSpeedDegS < 5.0) ? 0 :
-                                       ((localErr + 3.0 < worldErr) ? -1 :
-                                       ((worldErr + 3.0 < localErr) ? 1 : 0));
+                const double angWorldErr = Length(base.omega - derivedWorldOmega) * kRadToDeg;
+                const double angLocalErr = Length(base.omega - derivedLocalOmega) * kRadToDeg;
+                const int angModelMatch = (Length(base.omega)*kRadToDeg < 5.0) ? 0 :
+                                          ((angLocalErr + 3.0 < angWorldErr) ? -1 :
+                                          ((angWorldErr + 3.0 < angLocalErr) ? 1 : 0));
+                hud.frameModel.store(angModelMatch);
+
+                // 2. Linear Ground Truth & Frame
+                const Vec3 derivedWorldVel = (s.p - base.p) * (1.0 / dt);
+                const Vec3 derivedLocalVel = QRotate(QConj(base.q), derivedWorldVel);
+
+                const double linSpeedMs = Length(derivedWorldVel);
+                hud.linSpeedMs.store(static_cast<float>(linSpeedMs));
+
+                const double linWorldErr = Length(base.velocity - derivedWorldVel) * 1000.0;
+                const double linLocalErr = Length(base.velocity - derivedLocalVel) * 1000.0;
+                const int linModelMatch = (linSpeedMs < 0.05) ? 0 :
+                                          ((linLocalErr + 15.0 < linWorldErr) ? -1 :
+                                          ((linWorldErr + 15.0 < linLocalErr) ? 1 : 0));
+                hud.linFrameModel.store(linModelMatch);
+
+                // 3. Linear Prediction Error vs Zero Extrapolation
+                const Vec3 predPosWithVel = base.p + base.velocity * dt;
+                const Vec3 predPosWithZero = base.p;
+                const double linPredErrWithVel = Length(predPosWithVel - s.p) * 1000.0;
+                const double linErrWithZero = Length(predPosWithZero - s.p) * 1000.0;
+
+                hud.linPredErrMm.store(static_cast<float>(linPredErrWithVel));
+                hud.linZeroErrMm.store(static_cast<float>(linErrWithZero));
+
+                double linAccelJump = 0;
+                if(havePrev) {
+                    const double ddt = std::max(1e-5, s.t - prev.t);
+                    linAccelJump = Length(s.velocity - prev.velocity) / ddt;
+                }
 
                 const Quat predWorld = IntegrateAngular(base.q, base.omega, dt, false);
-                const Quat predLocal = IntegrateAngular(base.q, base.omega, dt, true);
-                const double predWorldErr = RotationErrorDeg(predWorld, s.q);
-                const double predLocalErr = RotationErrorDeg(predLocal, s.q);
-                const double predErr = std::min(predWorldErr, predLocalErr);
+                const double rotPredErr = RotationErrorDeg(predWorld, s.q);
 
-                const Vec3 rawV = base.velocity;
-                const Vec3 localV = QRotate(base.q, rawV);
-                const double rawPosErr = Length((base.p + rawV*dt) - s.p) * 1000.0;
-                const double localPosErr = Length((base.p + localV*dt) - s.p) * 1000.0;
-                const double posErr = std::min(rawPosErr, localPosErr);
+                if(rotSpeedDegS > 15.0) highRotSpeedSamples++;
+                if(tilt > 15.0 && rotSpeedDegS >= 10.0) tiltEligibleSamples++;
 
-                hud.frameModel.store(modelMatch);
-
-                if(currentSpeedDegS > 15.0) {
-                    highSpeedSamples++;
-                    if(Length(s.audit.sysInstantOmega) < 1e-4) auditInstantZeroCount++;
-                    if(Length(s.audit.sysPredOmega) < 1e-4) auditPredZeroCount++;
-                    if(Length(s.audit.sysRawSpaceOmega) < 1e-4) auditRawSpaceZeroCount++;
-                    if(Length(s.audit.waitGetRenderOmega) < 1e-4) auditRenderZeroCount++;
-                    if(Length(s.audit.waitGetGameOmega) < 1e-4) auditGameZeroCount++;
-                    if(ctrlMaxSpeed > 5.0) auditControllerActiveCount++;
+                if(linSpeedMs > 0.08) {
+                    highLinSpeedSamples++;
+                    if(Length(s.audit.sysInstantVel) < 0.01) auditInstantLinZeroCount++;
+                    if(Length(s.audit.sysPredVel) < 0.01) auditPredLinZeroCount++;
+                    if(Length(s.audit.waitGetRenderVel) < 0.01) auditRenderLinZeroCount++;
                 }
-                if(tilt > 15.0 && reportedSpeedDegS >= 10.0) {
-                    tiltEligibleSamples++;
-                }
-                if(state == TestState::Phase1_Upright && reportedSpeedDegS >= 10.0) {
-                    uprightEligibleSamples++;
-                }
-
-                // Threshold for treating the reported-velocity vs. re-integrated-pose
-                // mismatch as a genuine prediction fault rather than ordinary numerical
-                // noise. 5 degrees of rotation error over the ~11ms prediction window
-                // used elsewhere in this file is well above what quantization/estimation
-                // noise alone would produce at these sample rates.
-                constexpr double kPredictionErrorThresholdDeg = 5.0;
 
                 std::string flags;
-                if(currentSpeedDegS > 15.0 && reportedSpeedDegS < 1.0) {
-                    if(!flags.empty()) flags += '|'; flags += "ZERO_VEL_BUG";
+                if(rotSpeedDegS > 15.0 && Length(base.omega)*kRadToDeg < 1.0) {
+                    if(!flags.empty()) flags += '|'; flags += "ZERO_ANG_VEL";
                 }
-
-                // AV_FRAME_BUG fires ONLY if modelMatch == -1 (Local Frame is strictly better fit)
-                if(modelMatch == -1 && tilt > 15.0 && reportedSpeedDegS >= 10.0) {
+                if(angModelMatch == -1 && tilt > 15.0 && rotSpeedDegS >= 10.0) {
                     if(!flags.empty()) flags += '|'; flags += "AV_FRAME_BUG";
                 }
-
-                // PRED_ROT_BUG: the reported angular velocity, integrated forward over
-                // the real elapsed dt, fails to predict the actual measured orientation
-                // to within kPredictionErrorThresholdDeg. This is what the "Upright
-                // Prediction Faults" metric is meant to measure -- previously flags never
-                // contained the substring the Phase1 counter looked for ("PRED_ROT"), so
-                // uprightIssues was permanently 0. Gated on reportedSpeedDegS so it only
-                // fires when there's enough motion for the prediction to be meaningful.
-                if(predErr > kPredictionErrorThresholdDeg && reportedSpeedDegS >= 10.0) {
-                    if(!flags.empty()) flags += '|'; flags += "PRED_ROT_BUG";
+                if(linSpeedMs > 0.08 && Length(base.velocity) < 0.01) {
+                    if(!flags.empty()) flags += '|'; flags += "ZERO_LIN_VEL";
+                }
+                if(linModelMatch == -1 && linSpeedMs > 0.08) {
+                    if(!flags.empty()) flags += '|'; flags += "LIN_FRAME_LOCAL_BUG";
+                }
+                if(linPredErrWithVel > linErrWithZero * 1.5 && linSpeedMs > 0.08) {
+                    if(!flags.empty()) flags += '|'; flags += "LIN_OVERSHOOT_ERROR";
                 }
 
-                if(state == TestState::Phase1_Upright || state == TestState::Phase2_Tilted) {
+                if(state == TestState::Phase1_Upright || state == TestState::Phase2_Tilted || state == TestState::Phase3_Leaning) {
                     totalLoggedSamples++;
-                    if(!flags.empty()) {
+                    bool isErrorSample = !flags.empty();
+
+                    PhaseStats* curStats = (state == TestState::Phase1_Upright ? &p1Stats :
+                                           (state == TestState::Phase2_Tilted ? &p2Stats : &p3Stats));
+                    curStats->totalSamples++;
+                    if(rotSpeedDegS > 15.0) curStats->highRotSamples++;
+                    if(tilt > 15.0 && rotSpeedDegS >= 10.0) curStats->tiltEligibleSamples++;
+                    if(linSpeedMs > 0.08) curStats->highLinSamples++;
+                    if(s.isDuplicateCall) curStats->duplicateCount++;
+                    if(s.isSnapback) {
+                        curStats->snapbackCount++;
+                        curStats->totalSnapbackDistMm += s.snapbackMagMm;
+                        if(s.snapbackMagMm < 1.0) curStats->snapSub1mm++;
+                        else if(s.snapbackMagMm < 2.0) curStats->snap1to2mm++;
+                        else curStats->snapOver2mm++;
+                    }
+
+                    if(isErrorSample) {
                         hud.totalIssues.fetch_add(1);
-                        if(flags.find("ZERO_VEL") != std::string::npos) {
+                        if(flags.find("ZERO_ANG_VEL") != std::string::npos) {
                             zeroVelIssues++;
                             hud.zeroVelEvents.store(zeroVelIssues);
                         }
-                        if(state == TestState::Phase1_Upright && flags.find("PRED_ROT") != std::string::npos) {
-                            uprightIssues++;
+                        if(flags.find("AV_FRAME_BUG") != std::string::npos) {
+                            avFrameIssues++;
+                            curStats->avFrameIssues++;
+                            hud.avFrameEvents.store(avFrameIssues);
                         }
-                        if(state == TestState::Phase2_Tilted && flags.find("AV_FRAME") != std::string::npos) {
-                            tiltedIssues++;
-                            hud.tiltEvents.store(tiltedIssues);
+                        if(flags.find("ZERO_LIN_VEL") != std::string::npos) {
+                            zeroLinVelIssues++;
+                            curStats->zeroLinVelIssues++;
+                            hud.zeroLinVelEvents.store(zeroLinVelIssues);
+                        }
+                        if(flags.find("LIN_OVERSHOOT") != std::string::npos) {
+                            linOvershootIssues++;
+                            curStats->linOvershootIssues++;
+                            hud.linOvershootEvents.store(linOvershootIssues);
                         }
                     }
+
+                    std::string pName = (state == TestState::Phase1_Upright ? "UPRIGHT" :
+                                        (state == TestState::Phase2_Tilted ? "TILTED" : "LEANING"));
+
+                    LogEntry entry{base, pName, tilt, derivedWorldOmega, derivedWorldVel, derivedLocalVel,
+                                   rotPredErr, linPredErrWithVel, linErrWithZero, angModelMatch, linModelMatch, linAccelJump, flags,
+                                   s.sampleDt * 1000.0, dt * 1000.0, s.stepDelta * 1000.0, s.stepDistMm, s.stepSpeedMs,
+                                   s.isSnapback, s.snapbackMagMm, s.isDuplicateCall,
+                                   angWorldErr, angLocalErr, (angWorldErr - angLocalErr)};
+
                     if(csv && csv->is_open()) {
-                        LogEvent(*csv, base, (state == TestState::Phase1_Upright ? "UPRIGHT" : "TILTED"),
-                                 tilt, measuredWorldOmega, measuredLocal, predErr, worldErr, localErr, modelMatch, posErr, accelJump, flags);
+                        LogEvent(*csv, entry);
+                    }
+
+                    if(incidentCsv && incidentCsv->is_open()) {
+                        if(isErrorSample) {
+                            if(!inIncident) {
+                                inIncident = true;
+                                currentIncidentId++;
+                                totalIncidentsDetected++;
+                                for(const auto& pre : preIncidentBuffer) {
+                                    LogEvent(*incidentCsv, pre, currentIncidentId, "PRE_GOOD");
+                                }
+                            }
+                            LogEvent(*incidentCsv, entry, currentIncidentId, "INCIDENT");
+                            postRecoveryRemaining = 2;
+                        } else {
+                            if(inIncident && postRecoveryRemaining > 0) {
+                                LogEvent(*incidentCsv, entry, currentIncidentId, "POST_RECOVERY");
+                                postRecoveryRemaining--;
+                                if(postRecoveryRemaining == 0) {
+                                    inIncident = false;
+                                }
+                            }
+                            preIncidentBuffer.push_back(entry);
+                            while(preIncidentBuffer.size() > 2) {
+                                preIncidentBuffer.pop_front();
+                            }
+                        }
                     }
                 }
             }
@@ -1255,6 +1444,8 @@ int main(int, char**) {
     });
 
     bool lastTriggerState = false;
+    auto lastRenderTime = std::chrono::steady_clock::now();
+    const auto sweepStartTime = std::chrono::steady_clock::now();
 
     while(gRunning.load()) {
         MSG msg{};
@@ -1275,12 +1466,45 @@ int main(int, char**) {
             }
         }
 
+        if(gDynamicSweepActive.load()) {
+            const double sweepElapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - sweepStartTime).count();
+            const float cycle = std::fmod(static_cast<float>(sweepElapsed), 60.0f);
+            const float sweepFps = (cycle < 30.0f) ? (90.0f - cycle) : (60.0f + (cycle - 30.0f));
+            gTargetSimFps.store(sweepFps);
+        }
+
+        // Synchronous frame pacing before WaitGetPoses
+        const float targetFps = gTargetSimFps.load();
+        if(targetFps < 89.0f) {
+            const double frameBudgetSec = 1.0 / static_cast<double>(targetFps);
+            while(true) {
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsed = std::chrono::duration<double>(now - lastRenderTime).count();
+                if(elapsed >= frameBudgetSec) break;
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        }
+        lastRenderTime = std::chrono::steady_clock::now();
+
+        vr::Compositor_FrameTiming timing{};
+        timing.m_nSize = sizeof(vr::Compositor_FrameTiming);
+        if(compositor->GetFrameTiming(&timing, 0)) {
+            hud.appFps.store(timing.m_flClientFrameIntervalMs > 0.001f ? (1000.0f / timing.m_flClientFrameIntervalMs) : targetFps);
+            const float reprojected = (timing.m_nNumFramePresents > 1 || timing.m_nNumDroppedFrames > 0) ? 1.0f : 0.0f;
+            hud.reprojectRatio.store(reprojected);
+
+            const double currentSpeedRadS = Length(gCompositorRenderOmega);
+            const double warpTime = std::max(0.0, (timing.m_nNumFramePresents > 1) ? 0.0222 : 0.0111);
+            const float warpAngle = static_cast<float>(currentSpeedRadS * warpTime * kRadToDeg);
+            hud.warpAngleDeg.store(warpAngle);
+
+            hud.blackEdgeRisk.store(warpAngle > 3.5f);
+        }
+
         vr::TrackedDevicePose_t renderPoses[vr::k_unMaxTrackedDeviceCount]{};
         vr::TrackedDevicePose_t gamePoses[vr::k_unMaxTrackedDeviceCount]{};
         vr::TrackedDeviceIndex_t leftIdx, rightIdx;
         {
-            // WaitGetPoses is deliberately NOT covered by gVrApiMutex -- see the
-            // long comment above the sampler thread's pose queries for why.
             compositor->WaitGetPoses(renderPoses, vr::k_unMaxTrackedDeviceCount, gamePoses, vr::k_unMaxTrackedDeviceCount);
 
             std::lock_guard<std::mutex> vrLock(gVrApiMutex);
@@ -1292,18 +1516,22 @@ int main(int, char**) {
             std::lock_guard<std::mutex> lk(gRenderPosesMutex);
             if(renderPoses[0].bPoseIsValid) {
                 gCompositorRenderOmega = ReportedAngular(renderPoses[0]);
+                gCompositorRenderVel = ReportedLinear(renderPoses[0]);
             }
             if(gamePoses[0].bPoseIsValid) {
                 gCompositorGameOmega = ReportedAngular(gamePoses[0]);
+                gCompositorGameVel = ReportedLinear(gamePoses[0]);
             }
             if(leftIdx < vr::k_unMaxTrackedDeviceCount && renderPoses[leftIdx].bPoseIsValid) {
                 gControllerLeftOmega = ReportedAngular(renderPoses[leftIdx]);
+                gControllerLeftVel = ReportedLinear(renderPoses[leftIdx]);
                 gControllerLeftValid = true;
             } else {
                 gControllerLeftValid = false;
             }
             if(rightIdx < vr::k_unMaxTrackedDeviceCount && renderPoses[rightIdx].bPoseIsValid) {
                 gControllerRightOmega = ReportedAngular(renderPoses[rightIdx]);
+                gControllerRightVel = ReportedLinear(renderPoses[rightIdx]);
                 gControllerRightValid = true;
             } else {
                 gControllerRightValid = false;
@@ -1316,9 +1544,7 @@ int main(int, char**) {
         }
         lastTriggerState = triggerDown;
 
-        if(!renderer.Render(hud)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+        renderer.Render(hud);
     }
 
     if(sampler.joinable()) sampler.join();

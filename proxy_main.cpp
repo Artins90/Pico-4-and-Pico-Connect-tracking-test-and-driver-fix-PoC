@@ -10,6 +10,7 @@
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <atomic>
 #include <mutex>
 
 #if defined(__clang__)
@@ -36,209 +37,266 @@ static HMODULE g_hModule = nullptr;
 static HMODULE g_hOrigDriver = nullptr;
 static HmdDriverFactoryFn g_pfnOrigFactory = nullptr;
 static std::once_flag g_loadOrigDriverOnce;
+static std::mutex g_factoryMutex;
 
 struct Vec3 {
-    double x = 0, y = 0, z = 0;
-};
+    double x = 0.0, y = 0.0, z = 0.0;
 
-static Vec3 operator+(Vec3 a, Vec3 b) { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
-static Vec3 operator-(Vec3 a, Vec3 b) { return {a.x-b.x, a.y-b.y, a.z-b.z}; }
-static Vec3 operator*(Vec3 a, double s) { return {a.x*s, a.y*s, a.z*s}; }
+    constexpr Vec3() noexcept = default;
+    constexpr Vec3(double x_, double y_, double z_) noexcept : x(x_), y(y_), z(z_) {}
+
+    Vec3 operator+(const Vec3& o) const noexcept { return {x + o.x, y + o.y, z + o.z}; }
+    Vec3 operator-(const Vec3& o) const noexcept { return {x - o.x, y - o.y, z - o.z}; }
+    Vec3 operator*(double s) const noexcept { return {x * s, y * s, z * s}; }
+    double Dot(const Vec3& o) const noexcept { return x * o.x + y * o.y + z * o.z; }
+    double LengthSq() const noexcept { return x * x + y * y + z * z; }
+    double Length() const noexcept { return std::sqrt(LengthSq()); }
+};
 
 struct Quat {
-    double w = 1, x = 0, y = 0, z = 0;
+    double w = 1.0, x = 0.0, y = 0.0, z = 0.0;
 };
 
-static Quat QNormalize(Quat q) {
-    const double n = std::sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
-    if (n < 1e-12) return {1, 0, 0, 0};
-    return {q.w/n, q.x/n, q.y/n, q.z/n};
-}
-static Quat QConj(Quat q) { return {q.w, -q.x, -q.y, -q.z}; }
-static Quat QMul(Quat a, Quat b) {
-    return {
-        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
-        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w
-    };
-}
+class SRWLockGuard {
+public:
+    explicit SRWLockGuard(SRWLOCK& lock) noexcept : lock_(lock) {
+        AcquireSRWLockExclusive(&lock_);
+    }
+    ~SRWLockGuard() noexcept {
+        ReleaseSRWLockExclusive(&lock_);
+    }
+    SRWLockGuard(const SRWLockGuard&) = delete;
+    SRWLockGuard& operator=(const SRWLockGuard&) = delete;
+private:
+    SRWLOCK& lock_;
+};
 
 class HmdVelocitySynthesizer {
 public:
-    HmdVelocitySynthesizer() {
+    HmdVelocitySynthesizer() noexcept {
         LARGE_INTEGER freq;
         QueryPerformanceFrequency(&freq);
         perfFreq_ = static_cast<double>(freq.QuadPart);
+        invPerfFreq_ = (perfFreq_ > 0.0) ? (1.0 / perfFreq_) : 1.0;
     }
 
-    void Reset() {
-        std::lock_guard<std::mutex> lock(mutex_);
+    void Reset() noexcept {
+        SRWLockGuard lock(srwLock_);
         hasPrev_ = false;
-        smoothOmega_ = {0, 0, 0};
-        smoothVel_ = {0, 0, 0};
+        smoothOmega_ = {0.0, 0.0, 0.0};
+        smoothVel_ = {0.0, 0.0, 0.0};
+        cadenceFilteredVel_ = {0.0, 0.0, 0.0};
+        prevTime_ = 0.0;
+        lastStepTime_ = 0.0;
+        stepIntervalEma_ = 0.0166;
     }
 
-    void ProcessPose(vr::DriverPose_t& pose) {
+    void ProcessPose(vr::DriverPose_t& pose) noexcept {
+        pose.vecAcceleration[0] = pose.vecAcceleration[1] = pose.vecAcceleration[2] = 0.0;
+        pose.vecAngularAcceleration[0] = pose.vecAngularAcceleration[1] = pose.vecAngularAcceleration[2] = 0.0;
+
         if (!pose.poseIsValid) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            hasPrev_ = false;
-            // Tracking just went invalid: whatever velocity we were smoothing
-            // toward is no longer trustworthy (the HMD could resume anywhere,
-            // moving in any direction, once tracking recovers). Previously
-            // this only cleared hasPrev_, so smoothOmega_/smoothVel_ kept
-            // their last pre-loss values -- and once a new valid pose arrived,
-            // the "hasPrev_ == false" branch below re-syncs the reference pose
-            // but does NOT touch smoothOmega_/smoothVel_, so that stale,
-            // possibly-large velocity from before the tracking loss would get
-            // written into the very first recovered pose. Clearing here means
-            // the first pose(s) after recovery correctly report zero velocity
-            // until a new real finite-difference measurement is available.
-            smoothOmega_ = {0, 0, 0};
-            smoothVel_ = {0, 0, 0};
+            Reset();
+            pose.vecAngularVelocity[0] = pose.vecAngularVelocity[1] = pose.vecAngularVelocity[2] = 0.0;
+            pose.vecVelocity[0] = pose.vecVelocity[1] = pose.vecVelocity[2] = 0.0;
+            pose.poseTimeOffset = 0.0;
             return;
         }
 
         LARGE_INTEGER counter;
         QueryPerformanceCounter(&counter);
-        const double t = static_cast<double>(counter.QuadPart) / perfFreq_;
+        const double t = static_cast<double>(counter.QuadPart) * invPerfFreq_;
 
-        Quat curQ = QNormalize({pose.qRotation.w, pose.qRotation.x, pose.qRotation.y, pose.qRotation.z});
-        Vec3 curP = {pose.vecPosition[0], pose.vecPosition[1], pose.vecPosition[2]};
+        const double qw = pose.qRotation.w;
+        const double qx = pose.qRotation.x;
+        const double qy = pose.qRotation.y;
+        const double qz = pose.qRotation.z;
+        const double qNormSq = qw * qw + qx * qx + qy * qy + qz * qz;
 
-        std::lock_guard<std::mutex> lock(mutex_);
+        Quat curQ;
+        if (std::abs(qNormSq - 1.0) > 1e-12 && qNormSq > 1e-12) {
+            const double invNorm = 1.0 / std::sqrt(qNormSq);
+            curQ = {qw * invNorm, qx * invNorm, qy * invNorm, qz * invNorm};
+        } else if (qNormSq <= 1e-12) {
+            curQ = {1.0, 0.0, 0.0, 0.0};
+        } else {
+            curQ = {qw, qx, qy, qz};
+        }
+
+        const Vec3 curRawP{pose.vecPosition[0], pose.vecPosition[1], pose.vecPosition[2]};
+
+        SRWLockGuard lock(srwLock_);
 
         if (hasPrev_) {
             const double dt = t - prevTime_;
 
-            if (dt > kMaxReliableDt) {
-                // A gap this long (compositor/game hitch, stall, or a tracking
-                // blackout that didn't clear poseIsValid) makes any finite-
-                // difference derivative computed over it unreliable, and
-                // leaves whatever was previously smoothed stale relative to
-                // however far the device may actually have moved during the
-                // gap. Reset instead of continuing to report a (now stale)
-                // velocity across the gap indefinitely.
-                smoothOmega_ = {0, 0, 0};
-                smoothVel_ = {0, 0, 0};
-            } else if (dt >= kMinValidDt) {
-                const bool poseChanged = (std::abs(curQ.w - prevQ_.w) > 1e-5 ||
-                                          std::abs(curQ.x - prevQ_.x) > 1e-5 ||
-                                          std::abs(curQ.y - prevQ_.y) > 1e-5 ||
-                                          std::abs(curQ.z - prevQ_.z) > 1e-5 ||
-                                          std::abs(curP.x - prevP_.x) > 1e-4 ||
-                                          std::abs(curP.y - prevP_.y) > 1e-4 ||
-                                          std::abs(curP.z - prevP_.z) > 1e-4);
+            if (dt > kMaxReliableDt || dt < -kMaxBackwardStep) {
+                smoothOmega_ = {0.0, 0.0, 0.0};
+                smoothVel_ = {0.0, 0.0, 0.0};
+                cadenceFilteredVel_ = {0.0, 0.0, 0.0};
+                prevQ_ = curQ;
+                prevP_ = curRawP;
+                prevTime_ = t;
+                lastStepTime_ = t;
+            } else if (dt > kMinValidDt) {
+                const double invDt = 1.0 / dt;
 
-                if (poseChanged) {
-                    Quat dqWorld = QNormalize(QMul(curQ, QConj(prevQ_)));
-                    if (dqWorld.w < 0.0) {
-                        dqWorld.w = -dqWorld.w; dqWorld.x = -dqWorld.x; dqWorld.y = -dqWorld.y; dqWorld.z = -dqWorld.z;
-                    }
-                    const double halfW = std::clamp(dqWorld.w, 0.0, 1.0);
-                    const double angle = 2.0 * std::acos(halfW);
-                    Vec3 axis{dqWorld.x, dqWorld.y, dqWorld.z};
-                    const double sn = std::sin(angle * 0.5);
-                    if (sn > 1e-6) axis = axis * (1.0 / sn);
-                    else axis = {0, 0, 0};
+                // 1. Angular Velocity (Driver World Space)
+                double dqw_rot = curQ.w * prevQ_.w + curQ.x * prevQ_.x + curQ.y * prevQ_.y + curQ.z * prevQ_.z;
+                double dqx_rot = curQ.x * prevQ_.w - curQ.w * prevQ_.x - curQ.y * prevQ_.z + curQ.z * prevQ_.y;
+                double dqy_rot = curQ.y * prevQ_.w - curQ.w * prevQ_.y - curQ.z * prevQ_.x + curQ.x * prevQ_.z;
+                double dqz_rot = curQ.z * prevQ_.w - curQ.w * prevQ_.z - curQ.x * prevQ_.y + curQ.y * prevQ_.x;
 
-                    Vec3 derivedWorldOmega = axis * (angle / dt);
-                    Vec3 derivedWorldVel = (curP - prevP_) * (1.0 / dt);
-
-                    // Exponential smoothing normalized by the actual elapsed dt
-                    // (alpha = 1 - exp(-dt/tau)) instead of a fixed alpha=0.80
-                    // per-sample. A fixed per-sample alpha implicitly assumes a
-                    // constant sample rate; since dt is allowed to range from
-                    // kMinValidDt to kMaxReliableDt here, a fixed alpha means
-                    // the filter's effective cutoff frequency (and therefore
-                    // how much it smooths vs. lags) drifts with frame rate.
-                    // kSmoothingTimeConstant is chosen so that at a nominal
-                    // ~11.1ms sample interval (dt = -tau * ln(1 - alpha)),
-                    // this reproduces the original fixed alpha=0.80 behavior,
-                    // while degrading gracefully (more smoothing, proportionally
-                    // less lag increase) at other frame times.
-                    const double alpha = 1.0 - std::exp(-dt / kSmoothingTimeConstant);
-                    smoothOmega_ = derivedWorldOmega * alpha + smoothOmega_ * (1.0 - alpha);
-                    smoothVel_ = derivedWorldVel * alpha + smoothVel_ * (1.0 - alpha);
-                } else if (t - prevTime_ > kStationaryTimeoutSec) {
-                    smoothOmega_ = {0, 0, 0};
-                    smoothVel_ = {0, 0, 0};
+                const double dqNormSq = dqw_rot * dqw_rot + dqx_rot * dqx_rot + dqy_rot * dqy_rot + dqz_rot * dqz_rot;
+                if (dqNormSq > 1e-12) {
+                    const double invDqNorm = 1.0 / std::sqrt(dqNormSq);
+                    dqw_rot *= invDqNorm; dqx_rot *= invDqNorm; dqy_rot *= invDqNorm; dqz_rot *= invDqNorm;
                 }
-            }
-            // else: dt < kMinValidDt -- too small/noisy a sample interval to
-            // trust (possible duplicate pose update or timer jitter). Skip
-            // computing a new derivative this frame and keep the previously
-            // smoothed value.
+                if (dqw_rot < 0.0) {
+                    dqw_rot = -dqw_rot; dqx_rot = -dqx_rot; dqy_rot = -dqy_rot; dqz_rot = -dqz_rot;
+                }
 
-            // Always resync the reference pose, even on frames that fail the
-            // dt-window check above, so prevTime_ can never go stale and
-            // produce a huge synthetic velocity spike on the next valid frame.
-            prevQ_ = curQ;
-            prevP_ = curP;
-            prevTime_ = t;
+                const double halfW = std::clamp(dqw_rot, 0.0, 1.0);
+                const double angle = 2.0 * std::acos(halfW);
+                const double sn = std::sqrt(std::max(0.0, 1.0 - halfW * halfW));
+
+                Vec3 rawOmega{0.0, 0.0, 0.0};
+                if (sn > 1e-7) {
+                    const double scale = (angle * invDt) / sn;
+                    rawOmega = {dqx_rot * scale, dqy_rot * scale, dqz_rot * scale};
+                }
+
+                double rawOmegaSpeed = rawOmega.Length();
+                if (rawOmegaSpeed > kMaxPhysicalOmegaRadS) {
+                    rawOmega = rawOmega * (kMaxPhysicalOmegaRadS / rawOmegaSpeed);
+                    rawOmegaSpeed = kMaxPhysicalOmegaRadS;
+                }
+
+                const double fcRot = kFcMinRot + kBetaRot * rawOmegaSpeed;
+                const double alphaRot = 1.0 - std::exp(-2.0 * kPi * fcRot * dt);
+                smoothOmega_ = rawOmega * alphaRot + smoothOmega_ * (1.0 - alphaRot);
+
+                // 2. Linear Velocity (Jitter-Decoupled Step Cadence Estimator)
+                const Vec3 deltaP = curRawP - prevP_;
+                const double stepDist = deltaP.Length();
+
+                if (stepDist > kStepThreshold) {
+                    const double stepDt = t - lastStepTime_;
+                    if (stepDt > kMinValidDt && stepDt < kMaxReliableDt) {
+                        stepIntervalEma_ = stepIntervalEma_ * 0.95 + stepDt * 0.05;
+                        stepIntervalEma_ = std::clamp(stepIntervalEma_, 0.010, 0.025);
+
+                        Vec3 rawStepV = deltaP * (1.0 / stepDt);
+                        double rawSpeed = rawStepV.Length();
+                        if (rawSpeed > kMaxPhysicalVelMs) {
+                            rawStepV = rawStepV * (kMaxPhysicalVelMs / rawSpeed);
+                        }
+
+                        // Reversal detection: update immediately without lag
+                        if (rawStepV.Dot(cadenceFilteredVel_) <= 0.0 && rawSpeed > 0.03) {
+                            cadenceFilteredVel_ = rawStepV;
+                        } else {
+                            const double alphaCadence = 1.0 - std::exp(-stepDt / 0.020);
+                            cadenceFilteredVel_ = rawStepV * alphaCadence + cadenceFilteredVel_ * (1.0 - alphaCadence);
+                        }
+                    }
+                    lastStepTime_ = t;
+                }
+
+                const double fcLin = kFcMinLin + kBetaLin * cadenceFilteredVel_.Length();
+                const double alphaLin = 1.0 - std::exp(-2.0 * kPi * fcLin * dt);
+                smoothVel_ = cadenceFilteredVel_ * alphaLin + smoothVel_ * (1.0 - alphaLin);
+
+                // Decay gracefully if movement pauses (> 45ms without step)
+                const double dtSinceStep = t - lastStepTime_;
+                if (dtSinceStep > 0.045) {
+                    const double decay = std::exp(-(dtSinceStep - 0.045) / 0.015);
+                    smoothVel_ = smoothVel_ * decay;
+                    cadenceFilteredVel_ = cadenceFilteredVel_ * decay;
+                }
+
+                prevQ_ = curQ;
+                prevP_ = curRawP;
+                prevTime_ = t;
+            }
         } else {
             prevQ_ = curQ;
-            prevP_ = curP;
+            prevP_ = curRawP;
             prevTime_ = t;
+            lastStepTime_ = t;
+            smoothOmega_ = {0.0, 0.0, 0.0};
+            smoothVel_ = {0.0, 0.0, 0.0};
+            cadenceFilteredVel_ = {0.0, 0.0, 0.0};
             hasPrev_ = true;
         }
 
-        const bool omegaFinite = std::isfinite(smoothOmega_.x) && std::isfinite(smoothOmega_.y) && std::isfinite(smoothOmega_.z);
-        const bool velFinite = std::isfinite(smoothVel_.x) && std::isfinite(smoothVel_.y) && std::isfinite(smoothVel_.z);
+        // Dynamically offset SteamVR by half the estimated hardware frame interval
+        // to neutralize Pico's pre-baked exposure lead across any framerate.
+        pose.poseTimeOffset = 0.5 * stepIntervalEma_;
 
-        if (omegaFinite && velFinite) {
+        if (std::isfinite(smoothOmega_.x) && std::isfinite(smoothOmega_.y) && std::isfinite(smoothOmega_.z)) {
             pose.vecAngularVelocity[0] = smoothOmega_.x;
             pose.vecAngularVelocity[1] = smoothOmega_.y;
             pose.vecAngularVelocity[2] = smoothOmega_.z;
+        }
 
+        if (std::isfinite(smoothVel_.x) && std::isfinite(smoothVel_.y) && std::isfinite(smoothVel_.z)) {
             pose.vecVelocity[0] = smoothVel_.x;
             pose.vecVelocity[1] = smoothVel_.y;
             pose.vecVelocity[2] = smoothVel_.z;
         }
-        // else: leave pose.vecVelocity / vecAngularVelocity as the original
-        // driver set them rather than hand vrserver NaN/Inf.
     }
 
 private:
-    // dt bounds for trusting a finite-difference velocity estimate. Values
-    // preserved from the original implementation; only how they're used
-    // changed (see kMaxReliableDt handling above and the dt-normalized alpha).
-    static constexpr double kMinValidDt = 0.003;
-    static constexpr double kMaxReliableDt = 0.050;
-    static constexpr double kStationaryTimeoutSec = 0.080;
-    // tau such that alpha = 1 - exp(-dt/tau) reproduces the original fixed
-    // alpha = 0.80 at a nominal dt of 11.1ms: tau = -dt / ln(1 - alpha).
-    static constexpr double kSmoothingTimeConstant = 0.0069;
+    static constexpr double kPi = 3.14159265358979323846;
+    static constexpr double kMinValidDt = 0.0002;
+    static constexpr double kMaxReliableDt = 0.350;
+    static constexpr double kMaxBackwardStep = 0.020;
+    static constexpr double kStepThreshold = 0.00008; // 0.08mm motion threshold
 
-    std::mutex mutex_;
+    static constexpr double kFcMinLin = 5.0;
+    static constexpr double kBetaLin = 10.0;
+    static constexpr double kFcMinRot = 8.0;
+    static constexpr double kBetaRot = 0.8;
+
+    static constexpr double kMaxPhysicalVelMs = 10.0;
+    static constexpr double kMaxPhysicalOmegaRadS = 25.0;
+
+    SRWLOCK srwLock_ = SRWLOCK_INIT;
     double perfFreq_ = 1.0;
-    Quat prevQ_{1, 0, 0, 0};
-    Vec3 prevP_{0, 0, 0};
-    Vec3 smoothOmega_{0, 0, 0};
-    Vec3 smoothVel_{0, 0, 0};
+    double invPerfFreq_ = 1.0;
+
+    Quat prevQ_{1.0, 0.0, 0.0, 0.0};
+    Vec3 prevP_{0.0, 0.0, 0.0};
+    Vec3 smoothOmega_{0.0, 0.0, 0.0};
+    Vec3 smoothVel_{0.0, 0.0, 0.0};
+    Vec3 cadenceFilteredVel_{0.0, 0.0, 0.0};
+
     double prevTime_ = 0.0;
+    double lastStepTime_ = 0.0;
+    double stepIntervalEma_ = 0.0166;
     bool hasPrev_ = false;
 };
 
 static HmdVelocitySynthesizer g_hmdSynthesizer;
 
-// Proxy Server Driver Host to intercept TrackedDevicePoseUpdated
 class ProxyServerDriverHost final : public vr::IVRServerDriverHost {
 public:
-    ProxyServerDriverHost(vr::IVRServerDriverHost* pRealHost) : m_pRealHost(pRealHost) {}
+    explicit ProxyServerDriverHost(vr::IVRServerDriverHost* pRealHost) noexcept : m_pRealHost(pRealHost) {}
     ~ProxyServerDriverHost() = default;
 
     bool TrackedDeviceAdded(const char* pchDeviceSerialNumber, vr::ETrackedDeviceClass eDeviceClass, vr::ITrackedDeviceServerDriver* pDriver) override {
-        // Pass original, untouched pDriver directly to SteamVR so DirectMode & OpenXR work natively
         return m_pRealHost->TrackedDeviceAdded(pchDeviceSerialNumber, eDeviceClass, pDriver);
     }
 
     void TrackedDevicePoseUpdated(uint32_t unWhichDevice, const vr::DriverPose_t& newPose, uint32_t unPoseStructSize) override {
-        vr::DriverPose_t fixedPose = newPose;
         if (unWhichDevice == vr::k_unTrackedDeviceIndex_Hmd) {
+            vr::DriverPose_t fixedPose = newPose;
             g_hmdSynthesizer.ProcessPose(fixedPose);
+            m_pRealHost->TrackedDevicePoseUpdated(unWhichDevice, fixedPose, unPoseStructSize);
+        } else {
+            m_pRealHost->TrackedDevicePoseUpdated(unWhichDevice, newPose, unPoseStructSize);
         }
-        m_pRealHost->TrackedDevicePoseUpdated(unWhichDevice, fixedPose, unPoseStructSize);
     }
 
     void VsyncEvent(double vsyncTimeOffsetSeconds) override {
@@ -285,10 +343,9 @@ private:
     vr::IVRServerDriverHost* m_pRealHost = nullptr;
 };
 
-// Proxy Driver Context to intercept IVRServerDriverHost
 class ProxyDriverContext final : public vr::IVRDriverContext {
 public:
-    ProxyDriverContext(vr::IVRDriverContext* pRealCtx) : m_pRealCtx(pRealCtx) {}
+    explicit ProxyDriverContext(vr::IVRDriverContext* pRealCtx) noexcept : m_pRealCtx(pRealCtx) {}
     ~ProxyDriverContext() = default;
 
     void* GetGenericInterface(const char* pchInterfaceVersion, vr::EVRInitError* peError = nullptr) override {
@@ -313,10 +370,9 @@ private:
     std::unique_ptr<ProxyServerDriverHost> m_pProxyHost;
 };
 
-// Proxy Tracked Device Provider
 class ProxyTrackedDeviceProvider final : public vr::IServerTrackedDeviceProvider {
 public:
-    ProxyTrackedDeviceProvider(vr::IServerTrackedDeviceProvider* pRealProvider) : m_pRealProvider(pRealProvider) {}
+    explicit ProxyTrackedDeviceProvider(vr::IServerTrackedDeviceProvider* pRealProvider) noexcept : m_pRealProvider(pRealProvider) {}
     ~ProxyTrackedDeviceProvider() = default;
 
     vr::EVRInitError Init(vr::IVRDriverContext* pDriverContext) override {
@@ -371,14 +427,9 @@ static bool LoadOriginalDriver() {
 
             static constexpr wchar_t kOrigDriverSuffix[] = L"\\driver_pico_orig.dll";
             const size_t dirLen = wcslen(driverDir);
-            const size_t suffixLen = wcslen(kOrigDriverSuffix);
+            const size_t suffixLen = sizeof(kOrigDriverSuffix) / sizeof(wchar_t) - 1;
 
-            // Verify the full path (dir + suffix + null terminator) actually
-            // fits in MAX_PATH before building it. wcsncpy_s/wcsncat_s with
-            // _TRUNCATE would otherwise silently produce a shorter path than
-            // intended, and LoadLibraryExW could then load an unrelated file
-            // that happens to exist at the truncated path.
-            if (dirLen + suffixLen < MAX_PATH) {
+            if (dirLen + suffixLen < static_cast<size_t>(MAX_PATH)) {
                 wcsncpy_s(origDllPath, MAX_PATH, driverDir, _TRUNCATE);
                 wcsncat_s(origDllPath, MAX_PATH, kOrigDriverSuffix, _TRUNCATE);
             } else {
@@ -388,21 +439,20 @@ static bool LoadOriginalDriver() {
     }
 
     if (truncated) {
-        // The real driver directory path is known but doesn't fit alongside
-        // the target filename: refuse to guess at a shortened path rather
-        // than risk loading the wrong DLL.
         return false;
-    }
-
-    if (driverDir[0]) {
-        SetDllDirectoryW(driverDir);
     }
 
     g_hOrigDriver = LoadLibraryExW(origDllPath[0] ? origDllPath : L"driver_pico_orig.dll", NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!g_hOrigDriver) return false;
 
     g_pfnOrigFactory = reinterpret_cast<HmdDriverFactoryFn>(GetProcAddress(g_hOrigDriver, "HmdDriverFactory"));
-    return (g_pfnOrigFactory != nullptr);
+    if (!g_pfnOrigFactory) {
+        FreeLibrary(g_hOrigDriver);
+        g_hOrigDriver = nullptr;
+        return false;
+    }
+
+    return true;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
@@ -427,6 +477,7 @@ extern "C" __declspec(dllexport) void* HmdDriverFactory(const char* pInterfaceNa
     if (!pInterface) return nullptr;
 
     if (std::strncmp(pInterfaceName, "IServerTrackedDeviceProvider", 28) == 0) {
+        std::lock_guard<std::mutex> lock(g_factoryMutex);
         if (!g_pProxyProvider) {
             g_pProxyProvider = std::make_unique<ProxyTrackedDeviceProvider>(reinterpret_cast<vr::IServerTrackedDeviceProvider*>(pInterface));
         }
